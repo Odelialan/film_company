@@ -1,0 +1,65 @@
+﻿# === 依赖 ===
+node_modules/
+
+# === 构建产物 ===
+dist/
+tsconfig.tsbuildinfo
+
+# === 环境变量 / API Key ===
+.env
+.env.local
+.env.production
+server/.env
+server/model-config.json
+
+# === 用户数据 ===
+server/users.json
+server/user-data/
+
+# === 项目用户数据（运行时生成） ===
+/projects/
+
+# === Agent 运行时数据 ===
+agent/workspace-film-company/runs/
+agent/workspace-film-company/projects/P*/
+
+# === Agent 嵌套 .git 目录 ===
+agent/**/.git/
+
+# === Agent 运行时状态 ===
+agent/**/.openclaw/
+
+# === Agent memory（运行时积累） ===
+agent/**/memory/
+
+# === 日志 ===
+logs/
+*.log
+*.pid
+
+# === 大文件（图片视频素材） ===
+agent/**/*.png
+agent/**/*.jpg
+agent/**/*.jpeg
+agent/**/*.gif
+agent/**/*.mp4
+agent/**/*.mov
+agent/**/*.webm
+agent/**/*.webp
+# public/assets 中超过 1MB 的大图
+public/assets/polly.png
+public/assets/slide-scene.png
+
+# === 说明文档（非必要） ===
+docs/
+
+# === IDE / 编辑器 ===
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# === 系统文件 ===
+*.swp
+*.swo
+*~
