@@ -4,9 +4,32 @@ import express from "express";
 import fs from "node:fs";
 import fsp from "node:fs/promises";
 import { spawn } from "node:child_process";
-import { createHash, randomBytes, scryptSync, timingSafeEqual } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+
+import {
+  allowedMediaAssetExtensions,
+  assertAllowedMediaAssetPath,
+  assertWebEditableProjectPath,
+  normalizeRelativeProjectPath,
+  normalizeTrustedModelBaseUrl
+} from "./security-policy.js";
+import { approvalJournalRecoveryAction, assertDraftBaseline, deriveDraftManifestStatus, summarizeApproval, transitionDraftManifest } from "./approval-policy.js";
+import { recoverInterruptedJob } from "./job-policy.js";
+import { assetRequestHash, normalizeAssetIdempotencyKey, recoverInterruptedAssetJob } from "./asset-job-policy.js";
+import { buildStructuredLineDiff } from "./diff-policy.js";
+import { agentInputDocuments, allocateDocumentContext, fingerprintContextDocuments, formatAgentContextSections } from "./context-policy.js";
+import {
+  AuthStoreError,
+  deriveRecoveryAnswerRecord,
+  derivePasswordRecord,
+  normalizeRecoveryAnswer,
+  normalizeUsersRecord,
+  parseUsersRecord,
+  verifyPasswordRecord,
+  verifyRecoveryAnswerRecord
+} from "./auth-policy.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -15,10 +38,14 @@ dotenv.config({ path: path.join(__dirname, ".env") });
 dotenv.config();
 
 const app = express();
-app.set("trust proxy", 1);
+const trustProxySetting = String(process.env.FILM_TRUST_PROXY || "loopback").trim();
+app.set("trust proxy", /^\d+$/.test(trustProxySetting) ? Number(trustProxySetting) : trustProxySetting);
+app.disable("x-powered-by");
 const serviceName = "film-studio-api";
 const port = Number(process.env.PORT || 4080);
+const bindHost = String(process.env.FILM_BIND_HOST || "127.0.0.1").trim();
 const frontendOrigin = process.env.FRONTEND_ORIGIN || "https://film.odelialan.space";
+const canonicalFrontendOrigin = new URL(frontendOrigin).origin;
 const distPath = path.resolve(__dirname, "..", "dist");
 const repoRoot = path.resolve(__dirname, "..");
 const localAgentRoot = path.join(repoRoot, "agent");
@@ -33,23 +60,45 @@ const filmWorkspacePath = requestedFilmWorkspace;
 const legacyProjectsRoot = path.join(filmWorkspacePath, "projects");
 const legacyRunsRoot = path.join(filmWorkspacePath, "runs");
 const projectTemplateRoot = path.join(legacyProjectsRoot, "_PROJECT_TEMPLATE");
-const projectsRoot = path.join(repoRoot, "projects");
+const projectsRoot = process.env.FILM_PROJECTS_ROOT
+  ? path.resolve(process.env.FILM_PROJECTS_ROOT)
+  : path.join(repoRoot, "projects");
 const migrationMapPath = path.join(projectsRoot, "_migration_map.json");
 const modelConfigPath = path.join(__dirname, "model-config.json");
-const usersPath = path.join(__dirname, "users.json");
-const userDataRoot = path.join(__dirname, "user-data");
+const usersPath = process.env.FILM_AUTH_STORE_PATH
+  ? path.resolve(process.env.FILM_AUTH_STORE_PATH)
+  : path.join(__dirname, "users.json");
+const userDataRoot = process.env.FILM_USER_DATA_ROOT
+  ? path.resolve(process.env.FILM_USER_DATA_ROOT)
+  : path.join(__dirname, "user-data");
+const authBackupPath = process.env.FILM_AUTH_BACKUP_PATH
+  ? path.resolve(process.env.FILM_AUTH_BACKUP_PATH)
+  : path.join(userDataRoot, "_auth", "users.backup.json");
 const authCookieName = "film_studio_session";
-const defaultOwnerEmail = String(process.env.FILM_DEFAULT_OWNER_EMAIL || "lanhanyue1994@163.com").toLowerCase();
+const defaultOwnerEmail = String(process.env.FILM_DEFAULT_OWNER_EMAIL || "").trim().toLowerCase();
 const dreaminaBin = process.env.DREAMINA_BIN || "/home/honeycake/.local/bin/dreamina";
-const dreaminaPollSeconds = Number(process.env.DREAMINA_POLL_SECONDS || 180);
+const dreaminaPollSeconds = positiveNumberEnv("DREAMINA_POLL_SECONDS", 180);
 const defaultProjectName = "未命名新项目";
-const runRecordFileNames = ["TASK.md", "ROUTE.json", "STATUS.json", "AGENT_WORK.json", "AGENT_EVENTS.json", "RESULT.md", "THREAD.json", "THREAD.md"];
+const runRecordFileNames = ["TASK.md", "ROUTE.json", "STATUS.json", "AGENT_WORK.json", "AGENT_EVENTS.json", "DRAFT_MANIFEST.json", "APPROVAL_JOURNAL.json", "APPROVAL_ROLLBACK_REQUEST.json", "RESULT.md", "THREAD.json", "THREAD.md"];
 const modelRequestTimeoutMs = positiveNumberEnv("FILM_MODEL_TIMEOUT_MS", 300_000);
 const modelMaxOutputTokens = positiveNumberEnv("FILM_MODEL_MAX_OUTPUT_TOKENS", 4096);
 const conversationContextMaxChars = positiveNumberEnv("FILM_CONVERSATION_CONTEXT_MAX_CHARS", 7000);
 const taskContextMaxChars = positiveNumberEnv("FILM_TASK_CONTEXT_MAX_CHARS", 12000);
-const agentBatchSize = positiveNumberEnv("FILM_AGENT_BATCH_SIZE", 3);
-const modelProfileFailoverEnabled = process.env.FILM_MODEL_PROFILE_FAILOVER !== "0";
+const modelProfileFailoverEnabled = process.env.FILM_MODEL_PROFILE_FAILOVER === "1";
+const crossProviderFailoverEnabled = process.env.FILM_ALLOW_CROSS_PROVIDER_FAILOVER === "1";
+const registrationEnabled = process.env.FILM_ALLOW_REGISTRATION === "1";
+const agentAssetGenerationEnabled = process.env.FILM_ALLOW_AGENT_ASSET_GENERATION === "1";
+const autoApplyAgentFiles = process.env.FILM_AUTO_APPLY_AGENT_FILES === "1";
+const maxAgentAssetRequests = positiveNumberEnv("FILM_MAX_AGENT_ASSET_REQUESTS", 3);
+const maxConcurrentFilmTasks = positiveNumberEnv("FILM_MAX_CONCURRENT_TASKS", 2);
+const maxConcurrentAssetTasks = positiveNumberEnv("FILM_MAX_CONCURRENT_ASSET_TASKS", 2);
+const maxConcurrentAssetTasksPerAccount = positiveNumberEnv("FILM_MAX_CONCURRENT_ASSET_TASKS_PER_ACCOUNT", 1);
+const maxDreaminaOutputBytes = positiveNumberEnv("FILM_MAX_DREAMINA_OUTPUT_BYTES", 2 * 1024 * 1024);
+const dreaminaSubmitTimeoutMs = positiveNumberEnv("FILM_DREAMINA_SUBMIT_TIMEOUT_MS", 120_000);
+const dreaminaQueryTimeoutMs = positiveNumberEnv("FILM_DREAMINA_QUERY_TIMEOUT_MS", 90_000);
+const minimumPasswordLength = positiveNumberEnv("FILM_MIN_PASSWORD_LENGTH", 12);
+const minimumRecoveryAnswerLength = positiveNumberEnv("FILM_MIN_RECOVERY_ANSWER_LENGTH", 8);
+const testMode = process.env.FILM_TEST_MODE === "1";
 
 const allowedOrigins = new Set([
   frontendOrigin,
@@ -68,21 +117,122 @@ app.use(cors({
   credentials: true
 }));
 app.use((req, res, next) => {
-  const host = String(req.headers.host || "");
-  const forwardedProto = String(req.headers["x-forwarded-proto"] || "");
-  const isLocalHost = /^(127\.0\.0\.1|localhost|\[::1\])(?::|$)/.test(host);
-  if (process.env.NODE_ENV === "production" && !isLocalHost && forwardedProto && !forwardedProto.includes("https")) {
-    res.redirect(308, `https://${host}${req.originalUrl}`);
+  res.setHeader("X-Content-Type-Options", "nosniff");
+  res.setHeader("Referrer-Policy", "no-referrer");
+  res.setHeader("Permissions-Policy", "camera=(), microphone=(), geolocation=(), payment=()");
+  res.setHeader("Cross-Origin-Opener-Policy", "same-origin");
+  res.setHeader("Cross-Origin-Resource-Policy", "same-origin");
+  res.setHeader(
+    "Content-Security-Policy",
+    "default-src 'self'; base-uri 'none'; object-src 'none'; frame-ancestors 'none'; form-action 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; media-src 'self' blob:; font-src 'self' data:; connect-src 'self'"
+  );
+  if (process.env.NODE_ENV === "production") {
+    res.setHeader("Strict-Transport-Security", "max-age=31536000; includeSubDomains");
+  }
+  next();
+});
+app.use((req, res, next) => {
+  const remoteAddress = String(req.socket.remoteAddress || "");
+  const isLoopbackPeer = remoteAddress === "127.0.0.1" || remoteAddress === "::1" || remoteAddress === "::ffff:127.0.0.1";
+  if (process.env.NODE_ENV === "production" && !isLoopbackPeer && !req.secure) {
+    res.redirect(308, `${canonicalFrontendOrigin}${req.originalUrl}`);
     return;
   }
   next();
 });
 app.use(express.json({ limit: "1mb" }));
 
+const rateLimitBuckets = new Map();
+const maxRateLimitBuckets = positiveNumberEnv("FILM_MAX_RATE_LIMIT_BUCKETS", 10_000);
+let lastRateLimitSweepAt = 0;
+
+function sweepExpiredRateLimitBuckets(now) {
+  if (now - lastRateLimitSweepAt < 60_000 && rateLimitBuckets.size < maxRateLimitBuckets) return;
+  lastRateLimitSweepAt = now;
+  for (const [bucketKey, bucket] of rateLimitBuckets.entries()) {
+    if (bucket.resetAt <= now) rateLimitBuckets.delete(bucketKey);
+  }
+}
+
+function createRateLimiter({ windowMs, max, key = (req) => req.ip || "unknown" }) {
+  return (req, res, next) => {
+    const now = Date.now();
+    sweepExpiredRateLimitBuckets(now);
+    const bucketKey = String(key(req) || "unknown");
+    const current = rateLimitBuckets.get(bucketKey);
+    if (!current && rateLimitBuckets.size >= maxRateLimitBuckets) {
+      res.setHeader("Retry-After", "60");
+      res.status(429).json({ ok: false, error: "Rate limit capacity has been reached. Try again later." });
+      return;
+    }
+    const bucket = !current || current.resetAt <= now
+      ? { count: 0, resetAt: now + windowMs }
+      : current;
+    bucket.count += 1;
+    rateLimitBuckets.set(bucketKey, bucket);
+    res.setHeader("RateLimit-Limit", String(max));
+    res.setHeader("RateLimit-Remaining", String(Math.max(0, max - bucket.count)));
+    res.setHeader("RateLimit-Reset", String(Math.ceil(bucket.resetAt / 1000)));
+    if (bucket.count > max) {
+      res.setHeader("Retry-After", String(Math.max(1, Math.ceil((bucket.resetAt - now) / 1000))));
+      res.status(429).json({ ok: false, error: "Too many requests. Try again later." });
+      return;
+    }
+    next();
+  };
+}
+
+const authRateLimit = createRateLimiter({
+  windowMs: 15 * 60_000,
+  max: positiveNumberEnv("FILM_AUTH_IP_RATE_LIMIT_PER_15_MIN", 60),
+  key: (req) => `auth:${req.ip || "unknown"}`
+});
+const authAccountRateLimit = createRateLimiter({
+  windowMs: 15 * 60_000,
+  max: 12,
+  key: (req) => `auth-account:${createHash("sha256").update(normalizeEmail(req.body?.email)).digest("hex").slice(0, 20)}`
+});
+const registrationRateLimit = createRateLimiter({
+  windowMs: 60 * 60_000,
+  max: 3,
+  key: (req) => `register:${req.ip || "unknown"}`
+});
+const passwordMutationRateLimit = createRateLimiter({
+  windowMs: 60 * 60_000,
+  max: 5,
+  key: (req) => `password:${req.user?.id || req.ip || "unknown"}`
+});
+const recoveryIpRateLimit = createRateLimiter({
+  windowMs: 60 * 60_000,
+  max: 20,
+  key: (req) => `recovery-ip:${req.ip || "unknown"}`
+});
+const recoveryAccountRateLimit = createRateLimiter({
+  windowMs: 60 * 60_000,
+  max: 6,
+  key: (req) => `recovery-account:${createHash("sha256").update(normalizeEmail(req.body?.email)).digest("hex").slice(0, 20)}`
+});
+const taskRateLimit = createRateLimiter({
+  windowMs: 60 * 60_000,
+  max: positiveNumberEnv("FILM_TASK_RATE_LIMIT_PER_HOUR", 12),
+  key: (req) => `task:${req.user?.id || req.ip || "unknown"}`
+});
+const assetRateLimit = createRateLimiter({
+  windowMs: 60 * 60_000,
+  max: positiveNumberEnv("FILM_ASSET_RATE_LIMIT_PER_HOUR", 20),
+  key: (req) => `asset:${req.user?.id || req.ip || "unknown"}`
+});
+const projectMutationRateLimit = createRateLimiter({
+  windowMs: 60 * 60_000,
+  max: positiveNumberEnv("FILM_PROJECT_MUTATION_RATE_LIMIT_PER_HOUR", 120),
+  key: (req) => `project-mutation:${req.user?.id || req.ip || "unknown"}`
+});
+
 await Promise.all([
   fsp.mkdir(projectsRoot, { recursive: true }),
-  fsp.mkdir(userDataRoot, { recursive: true })
+  fsp.mkdir(userDataRoot, { recursive: true, mode: 0o700 })
 ]);
+await ensurePrivateRuntimePermissions();
 
 const filmAgents = [
   {
@@ -315,8 +465,54 @@ function envModelProfile() {
   };
 }
 
+function trustedModelBaseUrls() {
+  const candidates = [
+    process.env.MODEL_BASE_URL || "https://api.aicodewith.com/chatgpt/v1",
+    ...String(process.env.FILM_ALLOWED_MODEL_BASE_URLS || "").split(",").map((item) => item.trim())
+  ];
+  try {
+    const record = JSON.parse(fs.readFileSync(modelConfigPath, "utf8"));
+    for (const profile of Array.isArray(record?.profiles) ? record.profiles : []) {
+      if (profile?.baseUrl) candidates.push(profile.baseUrl);
+    }
+  } catch {
+    // Environment configuration remains the trust source when no admin config exists.
+  }
+  const trusted = new Set();
+  for (const candidate of candidates.filter(Boolean)) {
+    try {
+      trusted.add(normalizeTrustedModelBaseUrl(candidate));
+    } catch {
+      // Ignore malformed administrator entries instead of expanding the trust boundary.
+    }
+  }
+  return trusted;
+}
+
+function assertTrustedModelBaseUrl(value) {
+  const normalized = normalizeTrustedModelBaseUrl(value);
+  if (!trustedModelBaseUrls().has(normalized)) {
+    const error = new Error("Model base URL is not in the server administrator allowlist.");
+    error.status = 400;
+    throw error;
+  }
+  return normalized;
+}
+
 function normalizeEmail(email) {
   return String(email || "").trim().toLowerCase();
+}
+
+const recoveryQuestions = Object.freeze([
+  { id: "account_name", question: "我的名字叫什么？" },
+  { id: "recovery_phrase", question: "你为这个账户设置的恢复暗语是什么？" },
+  { id: "childhood_story", question: "你童年最喜欢的故事、书或动画是什么？" },
+  { id: "first_creation", question: "你完成的第一件创作作品叫什么？" },
+  { id: "memorable_place", question: "一个对你有特殊意义的地点叫什么？" }
+]);
+
+function findRecoveryQuestion(questionId) {
+  return recoveryQuestions.find((item) => item.id === String(questionId || "")) || null;
 }
 
 function userIdFromEmail(email) {
@@ -325,40 +521,53 @@ function userIdFromEmail(email) {
 
 function readUsersSync() {
   try {
-    const record = JSON.parse(fs.readFileSync(usersPath, "utf8"));
-    return {
-      users: Array.isArray(record?.users) ? record.users : [],
-      sessions: Array.isArray(record?.sessions) ? record.sessions : []
-    };
-  } catch {
-    return { users: [], sessions: [] };
+    return parseUsersRecord(fs.readFileSync(usersPath, "utf8"));
+  } catch (error) {
+    if (error?.code === "ENOENT") return { users: [], sessions: [] };
+    if (error instanceof AuthStoreError) throw error;
+    throw new AuthStoreError(`Unable to read authentication store: ${error instanceof Error ? error.message : String(error)}`);
   }
 }
 
 async function writeUsers(record) {
-  await writeJson(usersPath, {
-    users: Array.isArray(record?.users) ? record.users : [],
-    sessions: Array.isArray(record?.sessions) ? record.sessions : []
-  });
+  const normalized = normalizeUsersRecord(record);
+  if (fs.existsSync(usersPath)) {
+    await fsp.mkdir(path.dirname(authBackupPath), { recursive: true, mode: 0o700 });
+    await fsp.chmod(path.dirname(authBackupPath), 0o700);
+    await fsp.copyFile(usersPath, authBackupPath);
+    await fsp.chmod(authBackupPath, 0o600);
+  }
+  await writeJson(usersPath, normalized);
 }
 
-function hashPassword(password, salt = randomBytes(16).toString("hex")) {
-  const hash = scryptSync(String(password || ""), salt, 64).toString("hex");
-  return { salt, hash };
+let usersMutationTail = Promise.resolve();
+
+async function withUsersMutationLock(action) {
+  const previous = usersMutationTail;
+  let release;
+  usersMutationTail = new Promise((resolve) => { release = resolve; });
+  await previous;
+  try {
+    return await action();
+  } finally {
+    release();
+  }
 }
 
-function verifyPassword(password, user) {
-  if (!user?.passwordHash || !user?.passwordSalt) return false;
-  const candidate = Buffer.from(hashPassword(password, user.passwordSalt).hash, "hex");
-  const stored = Buffer.from(user.passwordHash, "hex");
-  return candidate.length === stored.length && timingSafeEqual(candidate, stored);
+async function hashPassword(password, salt = randomBytes(16).toString("hex")) {
+  return derivePasswordRecord(password, salt);
+}
+
+async function verifyPassword(password, user) {
+  return verifyPasswordRecord(password, user);
 }
 
 function publicUser(user) {
   return user ? {
     id: user.id,
     email: user.email,
-    createdAt: user.createdAt || null
+    createdAt: user.createdAt || null,
+    recoveryConfigured: Boolean(user.recovery?.questionId && user.recovery?.answerHash && user.recovery?.answerSalt)
   } : null;
 }
 
@@ -379,8 +588,7 @@ function sessionHash(token) {
 }
 
 function cookieOptions(req, maxAgeSeconds = 30 * 24 * 60 * 60) {
-  const forwardedProto = String(req.headers["x-forwarded-proto"] || "");
-  const secure = req.secure || forwardedProto.includes("https") || process.env.COOKIE_SECURE === "true";
+  const secure = req.secure || process.env.COOKIE_SECURE === "true";
   const origin = String(req.headers.origin || "");
   const requestOrigin = `${secure ? "https" : "http"}://${req.headers.host || ""}`;
   const crossOriginCredentials = origin && allowedOrigins.has(origin) && origin !== requestOrigin && secure;
@@ -407,20 +615,26 @@ function clearSessionCookie(req, res) {
 }
 
 async function createUserSession(req, res, userId) {
-  const record = readUsersSync();
   const token = randomBytes(32).toString("hex");
   const now = Date.now();
   const expiresAt = new Date(now + 30 * 24 * 60 * 60 * 1000).toISOString();
-  record.sessions = [
-    {
-      tokenHash: sessionHash(token),
-      userId,
-      createdAt: new Date(now).toISOString(),
-      expiresAt
-    },
-    ...record.sessions.filter((session) => new Date(session.expiresAt || 0).getTime() > now)
-  ].slice(0, 200);
-  await writeUsers(record);
+  await withUsersMutationLock(async () => {
+    const record = readUsersSync();
+    const activeSessions = record.sessions.filter((session) => new Date(session.expiresAt || 0).getTime() > now);
+    const sameUserSessions = activeSessions.filter((session) => session.userId === userId).slice(0, 9);
+    const otherUserSessions = activeSessions.filter((session) => session.userId !== userId);
+    record.sessions = [
+      {
+        tokenHash: sessionHash(token),
+        userId,
+        createdAt: new Date(now).toISOString(),
+        expiresAt
+      },
+      ...sameUserSessions,
+      ...otherUserSessions
+    ].slice(0, 2000);
+    await writeUsers(record);
+  });
   setSessionCookie(req, res, token);
 }
 
@@ -433,11 +647,26 @@ async function authenticateRequest(req) {
   const session = record.sessions.find((item) => item.tokenHash === tokenHash && new Date(item.expiresAt || 0).getTime() > now);
   if (!session) return null;
   const user = record.users.find((item) => item.id === session.userId);
-  return user || null;
+  return user && !user.disabled ? user : null;
+}
+
+function sendAuthServiceError(res, error) {
+  console.error("[auth] authentication store unavailable", error instanceof Error ? error.message : String(error));
+  res.status(503).json({
+    ok: false,
+    error: "Authentication service is temporarily unavailable.",
+    code: "AUTH_STORE_UNAVAILABLE"
+  });
 }
 
 async function requireAuth(req, res, next) {
-  const user = await authenticateRequest(req).catch(() => null);
+  let user;
+  try {
+    user = await authenticateRequest(req);
+  } catch (error) {
+    sendAuthServiceError(res, error);
+    return;
+  }
   if (!user) {
     res.status(401).json({ ok: false, error: "Authentication required." });
     return;
@@ -493,16 +722,26 @@ function readModelSettingsSync(user = null) {
   }
   try {
     const record = JSON.parse(fs.readFileSync(configPath, "utf8"));
-    const existingProfiles = Array.isArray(record?.profiles) ? record.profiles : [];
+    if (!record || typeof record !== "object" || !Array.isArray(record.profiles)) {
+      throw new Error("Model configuration has an invalid root structure.");
+    }
+    const existingProfiles = record.profiles;
     const normalizedProfiles = existingProfiles.length
       ? existingProfiles.map((profile) => normalizeModelProfile(profile))
-      : [envProfile];
+      : user
+        ? [{ ...envProfile, id: "user-default", name: "Default", apiKey: "" }]
+        : [envProfile];
     const activeProfileId = normalizedProfiles.some((profile) => profile.id === record?.activeProfileId)
       ? record.activeProfileId
       : normalizedProfiles[0].id;
     return { activeProfileId, profiles: normalizedProfiles };
-  } catch {
-    return { activeProfileId: envProfile.id, profiles: [envProfile] };
+  } catch (cause) {
+    const error = new Error(user
+      ? "User model configuration is unavailable or invalid."
+      : "Server model configuration is unavailable or invalid.", { cause });
+    error.status = 503;
+    error.code = "MODEL_CONFIG_INVALID";
+    throw error;
   }
 }
 
@@ -526,6 +765,11 @@ async function writeModelSettings(input = {}, user = null) {
     const credentialProfile = existingById.get(profile.copyApiKeyFromProfileId);
     return normalizeModelProfile(profile, existingById.get(profile.id), credentialProfile);
   });
+  if (user) {
+    for (const profile of profiles) {
+      profile.baseUrl = assertTrustedModelBaseUrl(profile.baseUrl);
+    }
+  }
   if (!profiles.length) profiles.push(envModelProfile());
   const activeProfileId = profiles.some((profile) => profile.id === input.activeProfileId)
     ? input.activeProfileId
@@ -550,6 +794,9 @@ function getCallableAiConfigs(user = null) {
   if (modelProfileFailoverEnabled) {
     const fallbackProfiles = settings.profiles
       .filter((profile) => profile.id !== active.id)
+      .filter((profile) => crossProviderFailoverEnabled || (
+        profile.provider === active.provider && profile.baseUrl === active.baseUrl
+      ))
       .map((profile, index) => ({ profile, index }))
       .sort((a, b) => {
         const score = (item) => {
@@ -580,8 +827,7 @@ function getCallableAiConfigs(user = null) {
 
 function maskKey(key) {
   if (!key) return null;
-  if (key.length <= 10) return "configured";
-  return `${key.slice(0, 6)}...${key.slice(-4)}`;
+  return "configured";
 }
 
 function positiveNumberEnv(name, fallback) {
@@ -625,9 +871,35 @@ function shanghaiTimeKey() {
   return date.toISOString().slice(11, 16);
 }
 
-async function writeJson(filePath, value) {
+async function atomicWriteText(filePath, content, mode = 0o600) {
   await fsp.mkdir(path.dirname(filePath), { recursive: true });
-  await fsp.writeFile(filePath, `${JSON.stringify(value, null, 2)}\n`, "utf8");
+  const tempPath = resolveInside(
+    path.dirname(filePath),
+    `.${path.basename(filePath)}.${process.pid}.${cryptoRandom(6)}.tmp`
+  );
+  let handle = null;
+  try {
+    handle = await fsp.open(tempPath, "wx", mode);
+    await handle.writeFile(content, { encoding: "utf8" });
+    await handle.sync();
+    await handle.close();
+    handle = null;
+    await fsp.rename(tempPath, filePath);
+    await fsp.chmod(filePath, mode);
+    const directoryHandle = await fsp.open(path.dirname(filePath), "r").catch(() => null);
+    if (directoryHandle) {
+      await directoryHandle.sync().catch(() => {});
+      await directoryHandle.close();
+    }
+  } catch (error) {
+    await handle?.close().catch(() => {});
+    await fsp.rm(tempPath, { force: true }).catch(() => {});
+    throw error;
+  }
+}
+
+async function writeJson(filePath, value) {
+  await atomicWriteText(filePath, `${JSON.stringify(value, null, 2)}\n`);
 }
 
 function escapeHtml(value) {
@@ -719,6 +991,36 @@ async function pathStats(filePath) {
   }
 }
 
+async function ensurePrivateRuntimePermissions() {
+  await fsp.chmod(userDataRoot, 0o700).catch(() => {});
+  await Promise.all([
+    path.join(__dirname, ".env"),
+    usersPath,
+    modelConfigPath
+  ].map((filePath) => fsp.chmod(filePath, 0o600).catch(() => {})));
+  const userEntries = await fsp.readdir(userDataRoot, { withFileTypes: true }).catch(() => []);
+  for (const entry of userEntries) {
+    if (!entry.isDirectory()) continue;
+    const userPath = resolveInside(userDataRoot, entry.name);
+    await fsp.chmod(userPath, 0o700).catch(() => {});
+    const files = await listFilesRecursive(userPath).catch(() => []);
+    for (const filePath of files) {
+      await fsp.chmod(filePath, 0o600).catch(() => {});
+    }
+    const directories = [path.join(userPath, "agent-memory")];
+    while (directories.length) {
+      const directory = directories.pop();
+      const stat = await pathStats(directory);
+      if (!stat?.isDirectory()) continue;
+      await fsp.chmod(directory, 0o700).catch(() => {});
+      const children = await fsp.readdir(directory, { withFileTypes: true }).catch(() => []);
+      for (const child of children) {
+        if (child.isDirectory()) directories.push(path.join(directory, child.name));
+      }
+    }
+  }
+}
+
 function resolveInside(root, ...segments) {
   const resolvedRoot = path.resolve(root);
   const resolved = path.resolve(resolvedRoot, ...segments);
@@ -726,6 +1028,34 @@ function resolveInside(root, ...segments) {
     throw new Error("Path escapes the configured workspace root.");
   }
   return resolved;
+}
+
+async function resolveExistingFileInside(root, ...segments) {
+  const candidate = resolveInside(root, ...segments);
+  let realRoot;
+  let realCandidate;
+  try {
+    [realRoot, realCandidate] = await Promise.all([fsp.realpath(root), fsp.realpath(candidate)]);
+  } catch (error) {
+    if (error?.code === "ENOENT") {
+      const notFound = new Error("File not found.");
+      notFound.status = 404;
+      throw notFound;
+    }
+    throw error;
+  }
+  if (realCandidate !== realRoot && !realCandidate.startsWith(`${realRoot}${path.sep}`)) {
+    const error = new Error("Resolved file escapes the project root.");
+    error.status = 403;
+    throw error;
+  }
+  const stat = await fsp.stat(realCandidate);
+  if (!stat.isFile()) {
+    const error = new Error("Requested asset is not a file.");
+    error.status = 404;
+    throw error;
+  }
+  return realCandidate;
 }
 
 function projectRunsPath(projectId) {
@@ -769,6 +1099,11 @@ function resolveAgentWorkspace(agent) {
   return path.join(localAgentRoot, agent.workspaceName);
 }
 
+function userAgentMemoryDirectory(user, agentId) {
+  if (!user?.id) return "";
+  return resolveInside(userDataRoot, user.id, "agent-memory", agentId);
+}
+
 function extractTitle(markdown, fallback) {
   const match = normalizeText(markdown).match(/^#\s+(.+)$/m);
   return match?.[1]?.trim() || fallback;
@@ -783,8 +1118,6 @@ async function getStudioStatus() {
     ok: Boolean(workspace?.isDirectory()),
     ready: Boolean(workspace?.isDirectory() && projects?.isDirectory()),
     status: workspace?.isDirectory() ? "local" : "missing-workspace",
-    workspace: filmWorkspacePath,
-    projectStorage: projectsRoot,
     projectsReady: Boolean(projects?.isDirectory()),
     runsReady: Boolean(projects?.isDirectory())
   };
@@ -793,14 +1126,15 @@ async function getStudioStatus() {
 async function getAgentSummaries(includeContext = false, user = null) {
   return Promise.all(filmAgents.map(async (agent) => {
     const workspace = resolveAgentWorkspace(agent);
+    const scopedMemoryPath = userAgentMemoryDirectory(user, agent.id);
     const workspaceStat = await pathStats(workspace);
     const [soul, rules, tools, memory, todayMemory, yesterdayMemory] = await Promise.all([
-      readTextIfExists(path.join(workspace, "SOUL.md"), includeContext ? 1800 : 300),
-      readTextIfExists(path.join(workspace, "AGENTS.md"), includeContext ? 1600 : 300),
-      readTextIfExists(path.join(workspace, "TOOLS.md"), includeContext ? 1200 : 200),
-      readTextIfExists(path.join(workspace, "MEMORY.md"), includeContext ? 1000 : 200),
-      readTextIfExists(path.join(workspace, "memory", `${shanghaiDateKey(0)}.md`), includeContext ? 1400 : 200),
-      readTextIfExists(path.join(workspace, "memory", `${shanghaiDateKey(-1)}.md`), includeContext ? 1000 : 120)
+      readTextIfExists(path.join(workspace, "SOUL.md"), includeContext ? 1400 : 300),
+      readTextIfExists(path.join(workspace, "AGENTS.md"), includeContext ? 2000 : 300),
+      readTextIfExists(path.join(workspace, "TOOLS.md"), includeContext ? 1000 : 200),
+      scopedMemoryPath ? readTextIfExists(path.join(scopedMemoryPath, "MEMORY.md"), includeContext ? 1200 : 200) : "",
+      scopedMemoryPath ? readTextIfExists(path.join(scopedMemoryPath, `${shanghaiDateKey(0)}.md`), includeContext ? 1600 : 200) : "",
+      scopedMemoryPath ? readTextIfExists(path.join(scopedMemoryPath, `${shanghaiDateKey(-1)}.md`), includeContext ? 900 : 120) : ""
     ]);
     const recentMemory = [
       todayMemory && `TODAY_MEMORY:\n${todayMemory}`,
@@ -809,7 +1143,7 @@ async function getAgentSummaries(includeContext = false, user = null) {
 
     return {
       ...agent,
-      workspace,
+      workspace: agent.workspaceName,
       configured: Boolean(workspaceStat?.isDirectory()),
       model: getAiConfig(user).model,
       identity: null,
@@ -818,13 +1152,14 @@ async function getAgentSummaries(includeContext = false, user = null) {
       hasRules: Boolean(rules),
       hasTools: Boolean(tools),
       hasMemory: Boolean(memory || recentMemory),
-      contextPreview: includeContext ? truncate([
+      contextSections: includeContext ? { soul, rules, tools, memory, recentMemory } : undefined,
+      contextPreview: includeContext ? [
         soul && `SOUL:\n${soul}`,
         rules && `AGENTS:\n${rules}`,
         tools && `TOOLS:\n${tools}`,
         memory && `MEMORY:\n${memory}`,
         recentMemory
-      ].filter(Boolean).join("\n\n"), 2200) : undefined
+      ].filter(Boolean).join("\n\n") : undefined
     };
   }));
 }
@@ -1407,7 +1742,29 @@ function projectMetaPath(projectId) {
 }
 
 async function readProjectMeta(projectId) {
-  return await readJsonIfExists(projectMetaPath(projectId)).catch(() => null);
+  const filePath = projectMetaPath(projectId);
+  let raw;
+  try {
+    raw = await fsp.readFile(filePath, "utf8");
+  } catch (cause) {
+    if (cause?.code === "ENOENT") return null;
+    const error = new Error("Project ownership metadata is unavailable.", { cause });
+    error.status = 503;
+    error.code = "PROJECT_META_UNAVAILABLE";
+    throw error;
+  }
+  try {
+    const meta = JSON.parse(normalizeText(raw));
+    if (!meta || typeof meta !== "object" || !String(meta.ownerUserId || "").trim()) {
+      throw new Error("Project ownership metadata has an invalid root structure.");
+    }
+    return meta;
+  } catch (cause) {
+    const error = new Error("Project ownership metadata is invalid.", { cause });
+    error.status = 503;
+    error.code = "PROJECT_META_INVALID";
+    throw error;
+  }
 }
 
 async function writeProjectMeta(projectId, meta) {
@@ -1455,7 +1812,6 @@ async function getProjectSummary(projectId) {
 
   return {
     id: resolvedProjectId,
-    path: projectPath,
     title: parsed.editableName || extractTitle(brief || status, resolvedProjectId),
     runIdPrefix: parsed.runIdPrefix,
     editableName: parsed.editableName,
@@ -1518,13 +1874,26 @@ async function getProjectDocuments(projectId) {
     return {
       ...doc,
       folder: path.dirname(doc.relativePath),
-      path: filePath,
       state: !stat ? "缺失" : stat.size === 0 ? "空文件" : "已连接",
       size: stat?.size || 0,
       updatedAt: stat?.mtime ? stat.mtime.toISOString() : null,
       excerpt: truncate(text, 600)
     };
   }));
+}
+
+async function getAgentInputDocumentContext(projectId, agentId) {
+  const resolvedProjectId = await resolveProjectId(projectId);
+  const projectPath = resolveInside(projectsRoot, resolvedProjectId);
+  const relativePaths = agentInputDocuments[agentId] || agentInputDocuments.director;
+  const totalBudget = positiveNumberEnv("FILM_AGENT_DOCUMENT_CONTEXT_MAX_CHARS", 18_000);
+  const perDocumentLimit = positiveNumberEnv("FILM_AGENT_DOCUMENT_MAX_CHARS", 6_000);
+  const records = (await Promise.all(relativePaths.map(async (relativePath) => {
+    const content = await readTextIfExists(resolveInside(projectPath, relativePath), perDocumentLimit).catch(() => "");
+    return normalizeText(content).trim() ? { relativePath, content: normalizeText(content).trim() } : null;
+  }))).filter(Boolean);
+
+  return allocateDocumentContext(records, { totalBudget, perDocumentLimit });
 }
 
 async function getProjectWorkflowState(projectId) {
@@ -1543,32 +1912,92 @@ async function getProjectFile(projectId, relativePath) {
     error.status = 404;
     throw error;
   }
-  const content = await readTextIfExists(filePath, 500_000);
+  const rawContent = await fsp.readFile(filePath, "utf8");
+  const content = truncate(rawContent, 500_000);
   return {
     projectId: resolvedProjectId,
     name: path.basename(filePath),
     relativePath: path.relative(projectPath, filePath),
-    path: filePath,
     size: stat.size,
     updatedAt: stat.mtime.toISOString(),
+    contentHash: createHash("sha256").update(rawContent).digest("hex"),
     content,
     previewHtml: renderMarkdownPreview(content)
   };
 }
 
-async function saveProjectFile(projectId, relativePath, content) {
+async function projectFileSnapshot(projectPath, relativePath) {
+  const filePath = resolveInside(projectPath, relativePath);
+  let stat;
+  try {
+    stat = await fsp.stat(filePath);
+  } catch (error) {
+    if (error?.code === "ENOENT") return { relativePath, exists: false, hash: null, content: "", mode: 0o600 };
+    throw error;
+  }
+  if (!stat.isFile()) {
+    const error = new Error(`Project target is not a regular file: ${relativePath}`);
+    error.status = 409;
+    throw error;
+  }
+  const content = await fsp.readFile(filePath, "utf8");
+  return {
+    relativePath,
+    exists: true,
+    hash: createHash("sha256").update(content).digest("hex"),
+    content,
+    mode: stat.mode & 0o777
+  };
+}
+
+function normalizeIfMatch(value) {
+  return String(value || "").trim().replace(/^W\//, "").replace(/^"|"$/g, "");
+}
+
+async function backupProjectDocument(projectPath, relativePath, versionLabel) {
+  const sourcePath = resolveInside(projectPath, relativePath);
+  const stat = await pathStats(sourcePath);
+  if (!stat?.isFile() || stat.size === 0) return null;
+  const safeLabel = sanitizeProjectName(versionLabel) || createRunId();
+  const backupPath = resolveInside(projectPath, "_versions", relativePath, `${safeLabel}.bak`);
+  await fsp.mkdir(path.dirname(backupPath), { recursive: true });
+  await fsp.copyFile(sourcePath, backupPath);
+  await fsp.chmod(backupPath, 0o600);
+  return path.relative(projectPath, backupPath);
+}
+
+async function saveProjectFile(projectId, relativePath, content, expectedHash) {
   const resolvedProjectId = await resolveProjectId(projectId);
   const projectPath = resolveInside(projectsRoot, resolvedProjectId);
-  const filePath = resolveInside(projectPath, relativePath);
+  const normalizedPath = assertWebEditableProjectPath(relativePath);
+  if (Buffer.byteLength(String(content || ""), "utf8") > 500_000) {
+    const error = new Error("Project document exceeds the 500 KB edit limit.");
+    error.status = 413;
+    throw error;
+  }
+  const filePath = resolveInside(projectPath, normalizedPath);
+  const current = await projectFileSnapshot(projectPath, normalizedPath);
+  if (!expectedHash) {
+    const error = new Error("If-Match with the current content hash is required.");
+    error.status = 428;
+    throw error;
+  }
+  if (normalizeIfMatch(expectedHash) !== current.hash) {
+    const error = new Error("Project document changed after it was opened. Reload before saving.");
+    error.status = 409;
+    error.code = "PROJECT_FILE_CONFLICT";
+    throw error;
+  }
+  await backupProjectDocument(projectPath, normalizedPath, `web-${createRunId()}`);
   await fsp.mkdir(path.dirname(filePath), { recursive: true });
-  await fsp.writeFile(filePath, normalizeText(content), "utf8");
-  return getProjectFile(resolvedProjectId, relativePath);
+  await atomicWriteText(filePath, normalizeText(content));
+  return getProjectFile(resolvedProjectId, normalizedPath);
 }
 
 async function getProjectAssets(projectId) {
   const resolvedProjectId = await resolveProjectId(projectId);
   const projectPath = resolveInside(projectsRoot, resolvedProjectId);
-  const assetExtensions = new Set([".png", ".jpg", ".jpeg", ".webp", ".gif", ".svg", ".mp4", ".mov", ".webm"]);
+  const assetExtensions = allowedMediaAssetExtensions();
   const assets = [];
 
   async function walk(dirPath) {
@@ -1599,23 +2028,23 @@ async function getProjectAssets(projectId) {
   return assets.sort((a, b) => String(b.updatedAt).localeCompare(String(a.updatedAt))).slice(0, 80);
 }
 
-async function getAgentMemoryAndSkills() {
+async function getAgentMemoryAndSkills(user = null) {
   return Promise.all(filmAgents.map(async (agent) => {
     const workspace = resolveAgentWorkspace(agent);
-    const memoryPath = path.join(workspace, "memory");
+    const memoryPath = userAgentMemoryDirectory(user, agent.id);
     const skillsPath = path.join(workspace, "skills");
-    const memoryEntries = await fsp.readdir(memoryPath, { withFileTypes: true }).catch(() => []);
+    const memoryEntries = memoryPath ? await fsp.readdir(memoryPath, { withFileTypes: true }).catch(() => []) : [];
     const skillEntries = await fsp.readdir(skillsPath, { withFileTypes: true }).catch(() => []);
-    const topLevelMemory = await readTextIfExists(path.join(workspace, "MEMORY.md"), 2000);
+    const topLevelMemory = memoryPath ? await readTextIfExists(path.join(memoryPath, "MEMORY.md"), 2000) : "";
     return {
       agentId: agent.id,
       name: agent.name,
-      workspace,
-      memoryPath,
-      skillsPath,
+      workspace: agent.workspaceName,
+      memoryPath: memoryPath ? `agent-memory/${agent.id}` : null,
+      skillsPath: `${agent.workspaceName}/skills`,
       memoryCount: memoryEntries.filter((entry) => entry.isFile()).length + (topLevelMemory ? 1 : 0),
       skillCount: skillEntries.filter((entry) => entry.isDirectory() || entry.isFile()).length,
-      memoryIndex: topLevelMemory || await readTextIfExists(path.join(memoryPath, "MEMORY.md"), 2000),
+      memoryIndex: topLevelMemory,
       skillNames: skillEntries.slice(0, 12).map((entry) => entry.name)
     };
   }));
@@ -1644,7 +2073,6 @@ async function getRecentRuns(limit = 20, projectId = "", user = null) {
         const children = await getRunChildren(entry.name);
         return {
           id: entry.name,
-          path: runPath,
           createdAt: status?.createdAt || stat?.birthtime?.toISOString() || stat?.ctime?.toISOString() || null,
           updatedAt: status?.updatedAt || stat?.mtime?.toISOString() || null,
           status: status?.status || "done",
@@ -1919,6 +2347,9 @@ async function getRunDetail(runId, includeThread = true) {
   const status = await readJsonIfExists(path.join(runPath, "STATUS.json")).catch(() => null);
   const agentWork = await readJsonIfExists(path.join(runPath, "AGENT_WORK.json")).catch(() => null);
   const agentEvents = await readJsonIfExists(path.join(runPath, "AGENT_EVENTS.json")).catch(() => null);
+  const draftManifest = await readJsonIfExists(path.join(runPath, "DRAFT_MANIFEST.json")).catch(() => null);
+  const approvalJournal = await readJsonIfExists(path.join(runPath, "APPROVAL_JOURNAL.json"));
+  const approvalRollbackRequest = await readJsonIfExists(path.join(runPath, "APPROVAL_ROLLBACK_REQUEST.json"));
   const children = await getRunChildren(runId);
   const taskText = await readTextIfExists(path.join(runPath, "TASK.md"), 6000);
   const storedResultText = await readTextIfExists(path.join(runPath, "RESULT.md"), 12000);
@@ -1929,13 +2360,79 @@ async function getRunDetail(runId, includeThread = true) {
     if (!fileStat) return null;
       return {
         name,
-        path: filePath,
+        path: path.relative(repoRoot, filePath),
         relativePath: path.relative(repoRoot, filePath),
         size: fileStat?.size || 0,
         updatedAt: fileStat?.mtime ? fileStat.mtime.toISOString() : null
     };
   }))).filter(Boolean);
   const selectedAgents = route?.selectedAgents || [];
+  const approvalProjectPath = resolveInside(projectsRoot, located?.projectId || route?.projectId || "");
+  const approvalEntries = await Promise.all((draftManifest?.entries || []).map(async (entry) => {
+    const draftPath = resolveInside(runPath, entry.draftRelativePath);
+    const targetPath = entry.kind === "directory_handoff"
+      ? ""
+      : resolveInside(approvalProjectPath, entry.targetPath);
+    const draftContent = await readTextIfExists(draftPath, 200_000);
+    const currentSnapshot = targetPath ? await projectFileSnapshot(approvalProjectPath, entry.targetPath) : null;
+    const currentContent = currentSnapshot?.exists ? truncate(currentSnapshot.content, 200_000) : "";
+    return {
+      ...entry,
+      draftContent,
+      currentContent,
+      currentHash: currentSnapshot?.hash ?? null,
+      conflicted: entry.status === "pending" && currentSnapshot
+        ? Boolean(currentSnapshot.exists) !== Boolean(entry.baseExists) || currentSnapshot.hash !== (entry.baseHash ?? null)
+        : false,
+      diff: buildStructuredLineDiff(currentContent, draftContent)
+    };
+  }));
+  const approvalSummary = summarizeApproval(draftManifest);
+  const rollbackCandidateRecords = approvalJournalSnapshots(approvalJournal)
+    .filter((journal) => journal?.status === "committed" && journal?.decision === "approved")
+    .flatMap((journal) => (journal.entries || []).map((entry) => ({
+      journalId: journal.journalId,
+      entryId: entry.entryId,
+      agentId: entry.agentId,
+      targetPath: entry.targetPath,
+      decidedAt: journal.decidedAt || null,
+      publishedHash: entry.publishedHash
+    })));
+  const rollbackCandidates = (await Promise.all(rollbackCandidateRecords.map(async (entry) => {
+    const current = await projectFileSnapshot(approvalProjectPath, entry.targetPath);
+    return {
+      ...entry,
+      canRollback: draftManifest?.entries?.find((item) => item.id === entry.entryId)?.status === "approved"
+        && current.hash === entry.publishedHash
+    };
+  }))).filter((entry) => entry.canRollback);
+  const approval = draftManifest ? {
+    required: approvalSummary.required,
+    status: approvalSummary.status,
+    createdAt: draftManifest.createdAt || null,
+    updatedAt: draftManifest.updatedAt || null,
+    decidedAt: draftManifest.decidedAt || null,
+    publication: approvalJournal ? {
+      journalId: approvalJournal.journalId || null,
+      status: approvalJournal.status || "invalid",
+      recoveredAt: approvalJournal.recoveredAt || null,
+      committedAt: approvalJournal.committedAt || null,
+      recoveryReason: approvalJournal.recoveryReason || null
+    } : null,
+    rollback: {
+      available: rollbackCandidates.length > 0,
+      candidates: rollbackCandidates,
+      status: approvalRollbackRequest?.status || null,
+      rollbackId: approvalRollbackRequest?.rollbackId || null,
+      committedAt: approvalRollbackRequest?.committedAt || null,
+      error: approvalRollbackRequest?.error || null
+    },
+    entries: approvalEntries
+  } : {
+    required: false,
+    status: "not_required",
+    entries: []
+  };
   let synthesizedStatus = status || buildRunStatus({
     prompt: route?.prompt || extractPromptFromTask(taskText),
     projectId: located?.projectId || route?.projectId || null,
@@ -1957,13 +2454,13 @@ async function getRunDetail(runId, includeThread = true) {
 
   const detail = {
     id: runId,
-    path: runPath,
     createdAt: synthesizedStatus.createdAt || stat.birthtime?.toISOString() || stat.ctime?.toISOString() || null,
     updatedAt: synthesizedStatus.updatedAt || stat.mtime?.toISOString() || null,
     status: synthesizedStatus,
     events: synthesizedStatus.events || [],
     agentWork: Array.isArray(agentWork?.agents) ? agentWork.agents : buildAgentWork(route || { selectedAgents, reasons: [] }),
     agentEvents: Array.isArray(agentEvents?.events) ? agentEvents.events : [],
+    approval,
     prompt: route?.prompt || extractPromptFromTask(taskText),
     projectId: route?.projectId || located?.projectId || null,
     parentRunId: route?.parentRunId || status?.parentRunId || null,
@@ -1994,6 +2491,609 @@ async function getRunDetailForUser(runId, user, includeThread = true) {
     throw error;
   }
   return detail;
+}
+
+async function updateRunApprovalRecords({ runPath, decision, decidedAt, userId, publishedFiles = [], manifest }) {
+  const statusPath = path.join(runPath, "STATUS.json");
+  const workPath = path.join(runPath, "AGENT_WORK.json");
+  const eventsPath = path.join(runPath, "AGENT_EVENTS.json");
+  const statusRecord = await readJsonIfExists(statusPath).catch(() => ({})) || {};
+  const workRecord = await readJsonIfExists(workPath).catch(() => ({})) || {};
+  const eventsRecord = await readJsonIfExists(eventsPath).catch(() => ({})) || {};
+  const affectedAgents = new Set(publishedFiles.map((file) => file.agentId));
+  const manifestEntries = Array.isArray(manifest?.entries) ? manifest.entries : [];
+  const hasPending = manifestEntries.some((entry) => entry.status === "pending");
+  const overallStatus = deriveDraftManifestStatus(manifestEntries);
+  const finalRunStatus = hasPending ? "awaiting_approval" : overallStatus === "rejected" ? "rejected" : "done";
+  const agentDecision = (agentId) => {
+    const entries = manifestEntries.filter((entry) => entry.agentId === agentId);
+    if (entries.some((entry) => entry.status === "pending")) return "awaiting_approval";
+    return entries.some((entry) => entry.status === "approved") ? "done" : "rejected";
+  };
+  const approvedPaths = (agentId) => manifestEntries
+    .filter((entry) => entry.agentId === agentId && entry.status === "approved")
+    .map((entry) => entry.publishedPath || entry.targetPath);
+  const nextEvents = (eventsRecord.events || []).map((event) => {
+    if (!affectedAgents.has(event.owner)) return event;
+    const nextStatus = agentDecision(event.owner);
+    const files = approvedPaths(event.owner);
+    return {
+      ...event,
+      status: nextStatus,
+      detail: nextStatus === "awaiting_approval"
+        ? `已完成部分人工决策；${manifestEntries.filter((entry) => entry.agentId === event.owner && entry.status === "pending").length} 个交付物仍待审批。`
+        : nextStatus === "done"
+          ? `人工审批已完成，正式发布 ${files.length} 个交付物。`
+          : "人工审批已完成，该岗位交付物均未发布。",
+      files,
+      endedAt: nextStatus === "awaiting_approval" ? null : decidedAt
+    };
+  });
+  const nextWork = (workRecord.agents || []).map((work) => affectedAgents.has(work.agentId) ? {
+    ...work,
+    status: agentDecision(work.agentId),
+    writtenFiles: approvedPaths(work.agentId),
+    approval: { decision, decidedAt, userId, manifestStatus: overallStatus }
+  } : work);
+  const statusEvents = (statusRecord.events || []).map((event) => {
+    const updated = nextEvents.find((candidate) => candidate.id === event.id);
+    if (updated) return updated;
+    if (event.id === "review") return {
+      ...event,
+      status: hasPending ? "awaiting_approval" : overallStatus === "rejected" ? "rejected" : "done",
+      detail: hasPending
+        ? `部分草稿已决策，仍有 ${manifestEntries.filter((entry) => entry.status === "pending").length} 个草稿待审批。`
+        : overallStatus === "mixed"
+          ? "人工审批已完成：部分草稿发布，部分草稿拒绝。"
+          : overallStatus === "approved"
+            ? "人工审批已通过，Agent 草稿已发布到正式项目文件。"
+            : "人工审批已拒绝，正式项目文件未改动。",
+      endedAt: hasPending ? null : decidedAt
+    };
+    return event;
+  });
+  await Promise.all([
+    writeJson(eventsPath, { ...eventsRecord, events: nextEvents, updatedAt: decidedAt }),
+    writeJson(workPath, { ...workRecord, agents: nextWork, updatedAt: decidedAt }),
+    writeJson(statusPath, {
+      ...statusRecord,
+      status: finalRunStatus,
+      currentStage: hasPending ? "approval" : "archive",
+      approvalRequired: hasPending,
+      approvalDecision: overallStatus,
+      approvalDecidedAt: hasPending ? null : decidedAt,
+      updatedAt: decidedAt,
+      events: statusEvents,
+      completedStageCount: statusEvents.filter((event) => event.status === "done").length
+    })
+  ]);
+}
+
+function approvalJournalPath(projectId, runId) {
+  return resolveInside(projectRunsPath(projectId), runId, "APPROVAL_JOURNAL.json");
+}
+
+function approvalPublicationPath(entry, runId) {
+  if (entry.kind !== "directory_handoff") return normalizeRelativeProjectPath(entry.targetPath);
+  const directory = normalizeRelativeProjectPath(entry.targetPath);
+  return path.posix.join(directory, `${runId}_${entry.agentId}_handoff.md`);
+}
+
+async function syncPublishedFile(filePath) {
+  const handle = await fsp.open(filePath, "r");
+  try {
+    await handle.sync();
+  } finally {
+    await handle.close();
+  }
+  const directoryHandle = await fsp.open(path.dirname(filePath), "r").catch(() => null);
+  if (directoryHandle) {
+    await directoryHandle.sync().catch(() => {});
+    await directoryHandle.close();
+  }
+}
+
+async function prepareApprovalJournal({ projectId, runId, runPath, decision, decidedAt, userId, validated, publishedFiles = [] }) {
+  const projectPath = resolveInside(projectsRoot, projectId);
+  const previousJournal = await readJsonIfExists(approvalJournalPath(projectId, runId));
+  const previousHistory = Array.isArray(previousJournal?.history) ? previousJournal.history : [];
+  const previousSnapshot = previousJournal
+    ? Object.fromEntries(Object.entries(previousJournal).filter(([key]) => key !== "history"))
+    : null;
+  const journalId = `approval-${decidedAt.replace(/[:.]/g, "-")}-${cryptoRandom(5)}`;
+  const rollbackDirectory = resolveInside(runPath, "APPROVAL_ROLLBACK", journalId);
+  const entries = [];
+  if (decision === "approved") {
+    await fsp.mkdir(rollbackDirectory, { recursive: true, mode: 0o700 });
+    for (const [index, item] of validated.entries()) {
+      const targetPath = approvalPublicationPath(item.entry, runId);
+      const snapshot = await projectFileSnapshot(projectPath, targetPath);
+      const backupRelativePath = snapshot.exists
+        ? path.posix.join("APPROVAL_ROLLBACK", journalId, `${String(index + 1).padStart(3, "0")}-${cryptoRandom(5)}.bak`)
+        : null;
+      if (backupRelativePath) {
+        await atomicWriteText(resolveInside(runPath, backupRelativePath), snapshot.content, snapshot.mode);
+      }
+      entries.push({
+        entryId: item.entry.id,
+        agentId: item.entry.agentId,
+        targetPath,
+        baseExists: snapshot.exists,
+        baseHash: snapshot.hash,
+        baseMode: snapshot.mode,
+        backupRelativePath,
+        state: "pending",
+        publishedHash: null
+      });
+    }
+  }
+  const journal = {
+    version: 1,
+    journalId,
+    projectId,
+    runId,
+    decision,
+    decidedAt,
+    userId,
+    entryIds: validated.map((item) => item.entry.id),
+    status: decision === "approved" ? "publishing" : "published",
+    entries,
+    publishedFiles,
+    history: [...previousHistory, ...(previousSnapshot ? [previousSnapshot] : [])].slice(-100),
+    createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString()
+  };
+  await writeJson(approvalJournalPath(projectId, runId), journal);
+  return journal;
+}
+
+async function rollbackApprovalJournal(journal, runPath, reason = "Publication did not complete.") {
+  const projectPath = resolveInside(projectsRoot, journal.projectId);
+  const errors = [];
+  for (const entry of [...journal.entries].reverse()) {
+    try {
+      const targetPath = normalizeRelativeProjectPath(entry.targetPath);
+      if (!targetPath) throw new Error("Journal target path is invalid.");
+      const targetFile = resolveInside(projectPath, targetPath);
+      if (entry.baseExists) {
+        if (!entry.backupRelativePath) throw new Error(`Missing rollback backup for ${targetPath}.`);
+        const backupFile = resolveInside(runPath, entry.backupRelativePath);
+        const content = await fsp.readFile(backupFile, "utf8");
+        const backupHash = createHash("sha256").update(content).digest("hex");
+        if (backupHash !== entry.baseHash) throw new Error(`Rollback backup hash mismatch for ${targetPath}.`);
+        await atomicWriteText(targetFile, content, entry.baseMode || 0o600);
+      } else {
+        await fsp.rm(targetFile, { force: true });
+      }
+      const restored = await projectFileSnapshot(projectPath, targetPath);
+      if (restored.exists !== Boolean(entry.baseExists) || restored.hash !== (entry.baseHash ?? null)) {
+        throw new Error(`Rollback verification failed for ${targetPath}.`);
+      }
+      entry.state = "rolled_back";
+    } catch (error) {
+      errors.push(error instanceof Error ? error.message : String(error));
+    }
+  }
+  journal.updatedAt = new Date().toISOString();
+  journal.recoveredAt = journal.updatedAt;
+  journal.recoveryReason = truncate(reason, 1000);
+  if (errors.length) {
+    journal.status = "recovery_failed";
+    journal.recoveryErrors = errors;
+    await writeJson(approvalJournalPath(journal.projectId, journal.runId), journal);
+    const error = new Error(`Approval publication rollback failed: ${errors.join("; ")}`);
+    error.code = "APPROVAL_ROLLBACK_FAILED";
+    throw error;
+  }
+  journal.status = "rolled_back";
+  await writeJson(approvalJournalPath(journal.projectId, journal.runId), journal);
+  return journal;
+}
+
+async function finalizeApprovalJournal(journal, runPath) {
+  const manifestPath = draftManifestPath(journal.projectId, journal.runId);
+  const manifest = await readJsonIfExists(manifestPath);
+  if (!manifest) throw new Error(`Draft manifest is missing for approval journal ${journal.journalId}.`);
+  if (journal.decision === "approved") {
+    const projectPath = resolveInside(projectsRoot, journal.projectId);
+    for (const entry of journal.entries) {
+      const snapshot = await projectFileSnapshot(projectPath, entry.targetPath);
+      if (!snapshot.exists || !entry.publishedHash || snapshot.hash !== entry.publishedHash) {
+        throw new Error(`Published file verification failed for ${entry.targetPath}.`);
+      }
+    }
+  }
+  journal.status = "committing";
+  journal.updatedAt = new Date().toISOString();
+  await writeJson(approvalJournalPath(journal.projectId, journal.runId), journal);
+
+  const selectedIds = Array.isArray(journal.entryIds) && journal.entryIds.length
+    ? journal.entryIds
+    : [...new Set([
+        ...journal.entries.map((entry) => entry.entryId),
+        ...journal.publishedFiles.map((file) => file.entryId)
+      ].filter(Boolean))];
+  const selectedEntries = manifest.entries.filter((entry) => selectedIds.includes(entry.id));
+  if (selectedEntries.length !== selectedIds.length) {
+    throw new Error(`Draft manifest selection conflicts with approval journal ${journal.journalId}.`);
+  }
+  let nextManifest;
+  if (selectedEntries.every((entry) => entry.status === "pending")) {
+    nextManifest = transitionDraftManifest(manifest, {
+      decision: journal.decision,
+      decidedAt: journal.decidedAt,
+      userId: journal.userId,
+      entryIds: selectedIds
+    });
+  } else if (selectedEntries.every((entry) => (
+    entry.status === journal.decision && entry.decidedAt === journal.decidedAt
+  ))) {
+    nextManifest = manifest;
+  } else {
+    throw new Error(`Draft manifest conflicts with approval journal ${journal.journalId}.`);
+  }
+  nextManifest.entries = nextManifest.entries.map((entry) => entry.decidedAt === journal.decidedAt ? {
+    ...entry,
+    publishedPath: journal.decision === "approved"
+      ? journal.publishedFiles.find((file) => file.entryId === entry.id)?.targetPath || entry.targetPath
+      : null
+  } : entry);
+  await writeJson(manifestPath, nextManifest);
+  await updateRunApprovalRecords({
+    runPath,
+    decision: journal.decision,
+    decidedAt: journal.decidedAt,
+    userId: journal.userId,
+    publishedFiles: journal.publishedFiles,
+    manifest: nextManifest
+  });
+  journal.status = "committed";
+  journal.committedAt = new Date().toISOString();
+  journal.updatedAt = journal.committedAt;
+  await writeJson(approvalJournalPath(journal.projectId, journal.runId), journal);
+  return journal;
+}
+
+async function recoverApprovalJournalAtRun(projectId, runId, runPath) {
+  const journalFile = approvalJournalPath(projectId, runId);
+  const journal = await readJsonIfExists(journalFile);
+  if (!journal) return null;
+  if (journal.projectId !== projectId || journal.runId !== runId) {
+    throw new Error(`Approval journal identity mismatch at ${journalFile}.`);
+  }
+  const action = approvalJournalRecoveryAction(journal);
+  if (action === "rollback") return rollbackApprovalJournal(journal, runPath, "Recovered incomplete publication after process interruption.");
+  if (action === "commit") return finalizeApprovalJournal(journal, runPath);
+  return journal;
+}
+
+async function recoverIncompleteApprovalJournals() {
+  const projectEntries = await fsp.readdir(projectsRoot, { withFileTypes: true }).catch(() => []);
+  for (const projectEntry of projectEntries) {
+    if (!projectEntry.isDirectory() || !isProjectDirectoryName(projectEntry.name)) continue;
+    const runsPath = projectRunsPath(projectEntry.name);
+    const runEntries = await fsp.readdir(runsPath, { withFileTypes: true }).catch(() => []);
+    for (const runEntry of runEntries) {
+      if (!runEntry.isDirectory()) continue;
+      const runPath = resolveInside(runsPath, runEntry.name);
+      await recoverApprovalJournalAtRun(projectEntry.name, runEntry.name, runPath);
+    }
+  }
+}
+
+function approvalRollbackRequestPath(projectId, runId) {
+  return resolveInside(projectRunsPath(projectId), runId, "APPROVAL_ROLLBACK_REQUEST.json");
+}
+
+function approvalJournalSnapshots(journal) {
+  if (!journal) return [];
+  const { history = [], ...current } = journal;
+  return [...(Array.isArray(history) ? history : []), current];
+}
+
+function findApprovalJournalSnapshot(journal, journalId) {
+  const candidates = approvalJournalSnapshots(journal)
+    .filter((item) => item?.status === "committed" && item?.decision === "approved");
+  if (journalId) return candidates.find((item) => item.journalId === journalId) || null;
+  return candidates.at(-1) || null;
+}
+
+async function restorePublishedJournalEntry({ projectPath, runPath, entry }) {
+  const current = await projectFileSnapshot(projectPath, entry.targetPath);
+  const alreadyRestored = current.exists === Boolean(entry.baseExists) && current.hash === (entry.baseHash ?? null);
+  if (alreadyRestored) return;
+  if (!current.exists || !entry.publishedHash || current.hash !== entry.publishedHash) {
+    const error = new Error(`Published file changed after approval and cannot be rolled back automatically: ${entry.targetPath}`);
+    error.status = 409;
+    error.code = "APPROVAL_ROLLBACK_CONFLICT";
+    throw error;
+  }
+  const targetFile = resolveInside(projectPath, entry.targetPath);
+  if (entry.baseExists) {
+    if (!entry.backupRelativePath) throw new Error(`Rollback backup is missing for ${entry.targetPath}.`);
+    const backupContent = await fsp.readFile(resolveInside(runPath, entry.backupRelativePath), "utf8");
+    if (createHash("sha256").update(backupContent).digest("hex") !== entry.baseHash) {
+      throw new Error(`Rollback backup hash mismatch for ${entry.targetPath}.`);
+    }
+    await atomicWriteText(targetFile, backupContent, entry.baseMode || 0o600);
+  } else {
+    await fsp.rm(targetFile, { force: true });
+  }
+  const restored = await projectFileSnapshot(projectPath, entry.targetPath);
+  if (restored.exists !== Boolean(entry.baseExists) || restored.hash !== (entry.baseHash ?? null)) {
+    throw new Error(`Rollback verification failed for ${entry.targetPath}.`);
+  }
+}
+
+async function completeApprovalRollbackRequest(request, runPath) {
+  const requestPath = approvalRollbackRequestPath(request.projectId, request.runId);
+  const projectPath = resolveInside(projectsRoot, request.projectId);
+  let restoredCount = request.entries.filter((entry) => entry.state === "restored").length;
+  try {
+    for (const entry of request.entries) {
+      await restorePublishedJournalEntry({ projectPath, runPath, entry });
+      if (entry.state !== "restored") restoredCount += 1;
+      entry.state = "restored";
+      request.updatedAt = new Date().toISOString();
+      await writeJson(requestPath, request);
+    }
+    request.status = "files_restored";
+    request.updatedAt = new Date().toISOString();
+    await writeJson(requestPath, request);
+
+    const manifestPath = draftManifestPath(request.projectId, request.runId);
+    const manifest = await readJsonIfExists(manifestPath);
+    if (!manifest) throw new Error("Draft manifest is missing for approval rollback.");
+    const selectedIds = new Set(request.entryIds);
+    const selected = manifest.entries.filter((entry) => selectedIds.has(entry.id));
+    if (selected.length !== selectedIds.size || selected.some((entry) => !["approved", "rolled_back"].includes(entry.status))) {
+      const error = new Error("Draft manifest no longer matches the rollback request.");
+      error.status = 409;
+      error.code = "APPROVAL_ROLLBACK_MANIFEST_CONFLICT";
+      throw error;
+    }
+    const nextEntries = manifest.entries.map((entry) => selectedIds.has(entry.id) ? {
+      ...entry,
+      status: "rolled_back",
+      rolledBackAt: request.createdAt,
+      rolledBackByUserId: request.userId,
+      rollbackId: request.rollbackId
+    } : entry);
+    const nextManifest = {
+      ...manifest,
+      entries: nextEntries,
+      status: deriveDraftManifestStatus(nextEntries),
+      updatedAt: request.createdAt
+    };
+    await writeJson(manifestPath, nextManifest);
+    request.status = "committing";
+    request.updatedAt = new Date().toISOString();
+    await writeJson(requestPath, request);
+    await updateRunApprovalRecords({
+      runPath,
+      decision: "rejected",
+      decidedAt: request.createdAt,
+      userId: request.userId,
+      publishedFiles: request.entries.map((entry) => ({
+        entryId: entry.entryId,
+        agentId: entry.agentId,
+        targetPath: entry.targetPath
+      })),
+      manifest: nextManifest
+    });
+    request.status = "committed";
+    request.committedAt = new Date().toISOString();
+    request.updatedAt = request.committedAt;
+    await writeJson(requestPath, request);
+    return request;
+  } catch (error) {
+    request.status = error?.status === 409 && restoredCount === 0 ? "conflict" : "recovery_failed";
+    request.error = error instanceof Error ? error.message : String(error);
+    request.errorCode = error?.code || null;
+    request.updatedAt = new Date().toISOString();
+    await writeJson(requestPath, request).catch(() => {});
+    throw error;
+  }
+}
+
+async function rollbackApprovedDrafts({ runId, user, journalId = "", entryIds = null }) {
+  const detail = await getRunDetailForUser(runId, user, false);
+  return withProjectTaskLock(detail.projectId, async () => {
+    const located = await findRunLocation(runId);
+    const journal = await readJsonIfExists(approvalJournalPath(detail.projectId, runId));
+    const sourceJournal = findApprovalJournalSnapshot(journal, journalId);
+    if (!sourceJournal) {
+      const error = new Error("No committed approval publication is available to roll back.");
+      error.status = 409;
+      throw error;
+    }
+    const manifest = await readJsonIfExists(draftManifestPath(detail.projectId, runId));
+    const approvedIds = new Set((manifest?.entries || []).filter((entry) => entry.status === "approved").map((entry) => entry.id));
+    const requestedIds = entryIds == null
+      ? sourceJournal.entries.filter((entry) => approvedIds.has(entry.entryId)).map((entry) => entry.entryId)
+      : [...new Set((Array.isArray(entryIds) ? entryIds : []).map((id) => String(id || "").trim()).filter(Boolean))];
+    if (!requestedIds.length || requestedIds.length > 100) {
+      const error = new Error("Select between 1 and 100 published drafts to roll back.");
+      error.status = 400;
+      throw error;
+    }
+    const sourceEntries = new Map(sourceJournal.entries.map((entry) => [entry.entryId, entry]));
+    if (requestedIds.some((id) => !approvedIds.has(id) || !sourceEntries.has(id))) {
+      const error = new Error("One or more selected files are no longer eligible for rollback.");
+      error.status = 409;
+      error.code = "APPROVAL_ROLLBACK_SELECTION_CONFLICT";
+      throw error;
+    }
+    const previous = await readJsonIfExists(approvalRollbackRequestPath(detail.projectId, runId));
+    if (previous?.status === "recovery_failed") {
+      const error = new Error("A previous rollback partially completed and requires operator recovery.");
+      error.status = 503;
+      error.code = "APPROVAL_ROLLBACK_RECOVERY_REQUIRED";
+      throw error;
+    }
+    if (previous && previous.status !== "committed") {
+      return completeApprovalRollbackRequest(previous, located.runPath);
+    }
+    const { history = [], ...previousSnapshot } = previous || {};
+    const now = new Date().toISOString();
+    const request = {
+      version: 1,
+      rollbackId: `rollback-${now.replace(/[:.]/g, "-")}-${cryptoRandom(5)}`,
+      projectId: detail.projectId,
+      runId,
+      sourceJournalId: sourceJournal.journalId,
+      userId: user.id,
+      entryIds: requestedIds,
+      entries: requestedIds.map((id) => ({ ...sourceEntries.get(id), state: "pending" })),
+      status: "rolling_back",
+      createdAt: now,
+      updatedAt: now,
+      history: [...(Array.isArray(history) ? history : []), ...(previous ? [previousSnapshot] : [])].slice(-100)
+    };
+    await writeJson(approvalRollbackRequestPath(detail.projectId, runId), request);
+    await completeApprovalRollbackRequest(request, located.runPath);
+    return getRunDetailForUser(runId, user);
+  });
+}
+
+async function recoverIncompleteApprovalRollbacks() {
+  const projectEntries = await fsp.readdir(projectsRoot, { withFileTypes: true }).catch(() => []);
+  for (const projectEntry of projectEntries) {
+    if (!projectEntry.isDirectory() || !isProjectDirectoryName(projectEntry.name)) continue;
+    const runsPath = projectRunsPath(projectEntry.name);
+    const runEntries = await fsp.readdir(runsPath, { withFileTypes: true }).catch(() => []);
+    for (const runEntry of runEntries) {
+      if (!runEntry.isDirectory()) continue;
+      const runPath = resolveInside(runsPath, runEntry.name);
+      const request = await readJsonIfExists(path.join(runPath, "APPROVAL_ROLLBACK_REQUEST.json"));
+      if (request?.status === "recovery_failed") {
+        throw new Error(`Approval rollback recovery is required for run ${runEntry.name}: ${request.error || "unknown error"}`);
+      }
+      if (request && ["rolling_back", "files_restored", "committing"].includes(request.status)) {
+        await completeApprovalRollbackRequest(request, runPath);
+      }
+    }
+  }
+}
+
+async function decideRunDrafts({ runId, user, decision, entryIds = null }) {
+  const detail = await getRunDetailForUser(runId, user, false);
+  return withProjectTaskLock(detail.projectId, async () => {
+    const located = await findRunLocation(runId);
+    await recoverApprovalJournalAtRun(detail.projectId, runId, located.runPath);
+    const manifestPath = draftManifestPath(detail.projectId, runId);
+    const manifest = await readJsonIfExists(manifestPath).catch(() => null);
+    if (!manifest || manifest.status !== "pending") {
+      const error = new Error("This run has no pending drafts to decide.");
+      error.status = 409;
+      throw error;
+    }
+    const allPendingEntries = (manifest.entries || []).filter((entry) => entry.status === "pending");
+    if (!allPendingEntries.length) {
+      const error = new Error("This run has no pending drafts to decide.");
+      error.status = 409;
+      throw error;
+    }
+    const requestedEntryIds = entryIds == null
+      ? null
+      : [...new Set((Array.isArray(entryIds) ? entryIds : []).map((id) => String(id || "").trim()).filter(Boolean))];
+    if (requestedEntryIds && (!requestedEntryIds.length || requestedEntryIds.length > 100)) {
+      const error = new Error("Select between 1 and 100 pending drafts.");
+      error.status = 400;
+      throw error;
+    }
+    const pendingById = new Map(allPendingEntries.map((entry) => [entry.id, entry]));
+    if (requestedEntryIds?.some((id) => !pendingById.has(id))) {
+      const error = new Error("One or more selected drafts are no longer pending. Refresh the run before deciding.");
+      error.status = 409;
+      error.code = "DRAFT_SELECTION_CONFLICT";
+      throw error;
+    }
+    const pendingEntries = requestedEntryIds
+      ? requestedEntryIds.map((id) => pendingById.get(id))
+      : allPendingEntries;
+
+    const projectPath = resolveInside(projectsRoot, detail.projectId);
+    const validated = await Promise.all(pendingEntries.map(async (entry) => {
+      const agent = filmAgents.find((item) => item.id === entry.agentId);
+      const isDirectory = entry.kind === "directory_handoff";
+      const allowedDirectory = getDirectoryDeliverables(entry.agentId)
+        .map(normalizeRelativeProjectPath)
+        .includes(normalizeRelativeProjectPath(entry.targetPath));
+      const allowedFile = resolveAgentOutputPath(entry.agentId, entry.targetPath) === entry.targetPath;
+      if (!agent || (isDirectory ? !allowedDirectory : !allowedFile)) {
+        const error = new Error(`Draft target is no longer allowed: ${entry.targetPath}`);
+        error.status = 409;
+        throw error;
+      }
+      const draftPath = resolveInside(located.runPath, entry.draftRelativePath);
+      const content = await readTextIfExists(draftPath, 500_000);
+      if (!content.trim()) {
+        const error = new Error(`Draft content is missing: ${entry.id}`);
+        error.status = 409;
+        throw error;
+      }
+      let targetSnapshot = null;
+      if (!isDirectory && decision === "approved") {
+        targetSnapshot = await projectFileSnapshot(projectPath, entry.targetPath);
+        assertDraftBaseline(entry, targetSnapshot);
+      }
+      return { entry, agent, content, targetSnapshot };
+    }));
+
+    const decidedAt = new Date().toISOString();
+    const publishedFiles = decision === "rejected"
+      ? pendingEntries.map((entry) => ({ entryId: entry.id, agentId: entry.agentId, targetPath: entry.targetPath }))
+      : [];
+    const journal = await prepareApprovalJournal({
+      projectId: detail.projectId,
+      runId,
+      runPath: located.runPath,
+      decision,
+      decidedAt,
+      userId: user.id,
+      validated,
+      publishedFiles
+    });
+    if (decision === "approved") {
+      try {
+        for (const item of validated) {
+          const targetPath = item.entry.kind === "directory_handoff"
+            ? await writeDirectoryHandoff(detail.projectId, `${item.entry.targetPath}/`, runId, item.agent, item.entry.prompt, item.content)
+            : await writeAgentPlannedFile({
+              projectId: detail.projectId,
+              runId,
+              agent: item.agent,
+              prompt: item.entry.prompt,
+              filePlan: { path: item.entry.targetPath, mode: item.entry.mode, content: item.content },
+              source: "human_approved_agent_draft"
+            });
+          if (targetPath) {
+            const journalEntry = journal.entries.find((entry) => entry.entryId === item.entry.id);
+            if (!journalEntry || normalizeRelativeProjectPath(targetPath) !== journalEntry.targetPath) {
+              throw new Error(`Published path differs from the prepared journal target: ${targetPath}`);
+            }
+            await syncPublishedFile(resolveInside(projectPath, targetPath));
+            const publishedSnapshot = await projectFileSnapshot(projectPath, targetPath);
+            journalEntry.state = "applied";
+            journalEntry.publishedHash = publishedSnapshot.hash;
+            publishedFiles.push({ entryId: item.entry.id, agentId: item.entry.agentId, targetPath });
+            journal.publishedFiles = publishedFiles;
+            journal.updatedAt = new Date().toISOString();
+            await writeJson(approvalJournalPath(detail.projectId, runId), journal);
+          }
+        }
+      } catch (publishError) {
+        await rollbackApprovalJournal(journal, located.runPath, publishError instanceof Error ? publishError.message : String(publishError));
+        throw publishError;
+      }
+      journal.status = "published";
+      journal.updatedAt = new Date().toISOString();
+      await writeJson(approvalJournalPath(detail.projectId, runId), journal);
+    }
+    await finalizeApprovalJournal(journal, located.runPath);
+    return getRunDetailForUser(runId, user);
+  });
 }
 
 function extractPromptFromTask(taskText) {
@@ -2038,6 +3138,7 @@ function buildRunStatus({
   const selectedAgents = route?.selectedAgents || ["director"];
   const target = route?.targetStage ? `目标阶段：${route.targetStage.order}「${route.targetStage.name}」。` : "";
   const failedAgents = (agentEvents || []).filter(eventHasError);
+  const pendingAgents = (agentEvents || []).filter((event) => event?.status === "awaiting_approval");
   const events = [
     makeEvent({
       id: "intake",
@@ -2076,11 +3177,13 @@ function buildRunStatus({
       id: "review",
       label: "完成标准审查",
       owner: "director",
-      status: degraded || failedAgents.length ? "error" : "done",
+      status: degraded || failedAgents.length ? "error" : pendingAgents.length ? "pending" : "done",
       detail: degraded
         ? "总导演模型失败，未进入岗位交付审查。"
         : failedAgents.length
           ? `有 ${failedAgents.length} 个岗位未通过执行检查：${failedAgents.map((event) => event.owner).join(", ")}。`
+          : pendingAgents.length
+            ? `有 ${pendingAgents.length} 个岗位交付物等待人工审批；批准前不会写入正式项目文件。`
           : route?.mode === "project-audit-continuation" || route?.continuation
             ? "已检查本轮派发岗位的完成标准；项目整体仍以全项目文件审计和下一批未完成阶段为准，不声明全流程已完成。"
             : "已按本轮派发岗位的完成标准检查正式交付物和工具调用记录。",
@@ -2100,10 +3203,11 @@ function buildRunStatus({
     })
   ];
   const hasError = degraded || events.some(eventHasError);
+  const approvalRequired = !hasError && pendingAgents.length > 0;
 
   return {
-    status: hasError ? "error" : "done",
-    currentStage: "archive",
+    status: hasError ? "error" : approvalRequired ? "awaiting_approval" : "done",
+    currentStage: approvalRequired ? "approval" : "archive",
     createdAt: now,
     updatedAt: now,
     provider,
@@ -2111,6 +3215,7 @@ function buildRunStatus({
     rawId,
     parentRunId: parentRunId || null,
     degraded: Boolean(degraded || failedAgents.length),
+    approvalRequired,
     providerError,
     stageCount: events.length,
     completedStageCount: events.filter((event) => event.status === "done").length,
@@ -2188,8 +3293,7 @@ function routePrompt(prompt, projectProgress = null) {
   const auditPrompt = isWorkflowAuditPrompt(prompt);
   if ((continuation || auditPrompt) && Array.isArray(projectProgress?.summary?.incompleteStages) && projectProgress.summary.incompleteStages.length) {
     const incompleteStages = projectProgress.summary.incompleteStages;
-    const actionableStages = incompleteStages.filter((stage) => (stage.actionableMissingDeliverables || []).length);
-    const selectedStages = (actionableStages.length ? actionableStages : incompleteStages).slice(0, agentBatchSize);
+    const selectedStages = nextStage ? [nextStage] : incompleteStages.slice(0, 1);
     selectedStages.forEach((stage) => {
       const stageReason = buildStageReason(stage, stage.missingDeliverables);
       stageAgentIds(stage).forEach((agentId) => add(agentId, stageReason));
@@ -2253,6 +3357,22 @@ function routePrompt(prompt, projectProgress = null) {
     }
   }
 
+  if (nextStage) {
+    let blockedDownstream = false;
+    for (const agentId of [...selected]) {
+      if (agentId === "director") continue;
+      const stage = workflowStageForAgent(agentId);
+      if (stage && stage.order > nextStage.order) {
+        selected.delete(agentId);
+        blockedDownstream = true;
+      }
+    }
+    if (blockedDownstream) {
+      const stageReason = `${buildStageReason(nextStage, nextStage.missingDeliverables)}；后端阶段门禁已阻止下游岗位提前覆盖正式交付物。`;
+      stageAgentIds(nextStage).forEach((agentId) => add(agentId, stageReason));
+    }
+  }
+
   return {
     mode: selected.size > 4 ? "orchestrator-workers" : "single-orchestrator",
     stepBudget: selected.size,
@@ -2265,22 +3385,30 @@ function routePrompt(prompt, projectProgress = null) {
 }
 
 async function buildTaskContext({ prompt, route, projectId, parentRun = null, projectProgress = null, user = null }) {
-  const [agents, project, documents, teamWorkflow, teamRules, projectTemplate] = await Promise.all([
+  const [agents, project, documents, teamWorkflow, teamRules, projectTemplate, agentDocumentEntries] = await Promise.all([
     getAgentSummaries(true, user),
     projectId ? getProjectSummary(projectId) : null,
     projectId ? getProjectDocuments(projectId) : [],
     readTextIfExists(path.join(filmWorkspacePath, "TEAM_WORKFLOW.md"), 2500),
     readTextIfExists(path.join(filmWorkspacePath, "TEAM_RULES.md"), 2200),
-    readTextIfExists(path.join(filmWorkspacePath, "PROJECT_LIBRARY_TEMPLATE.md"), 2200)
+    readTextIfExists(path.join(filmWorkspacePath, "PROJECT_LIBRARY_TEMPLATE.md"), 2200),
+    Promise.all(route.selectedAgents.map(async (agentId) => [agentId, await getAgentInputDocumentContext(projectId, agentId)]))
   ]);
+  const agentDocuments = Object.fromEntries(agentDocumentEntries);
   const selectedAgents = agents.filter((agent) => route.selectedAgents.includes(agent.id));
-  const docContext = documents
-    .filter((doc) => doc.state === "已连接" && doc.excerpt)
-    .slice(0, 5)
-    .map((doc) => `## ${doc.relativePath}\n${doc.excerpt}`)
+  const directorDocumentEntries = agentDocuments.director || Object.values(agentDocuments).flat();
+  const docContext = directorDocumentEntries
+    .slice(0, 8)
+    .map((doc) => `## ${doc.relativePath}\n${truncate(doc.content, 1400)}`)
     .join("\n\n");
   const agentContext = selectedAgents
-    .map((agent) => `## ${agent.name} (${agent.id})\n${truncate(agent.contextPreview || "", 900)}`)
+    .map((agent) => `## ${agent.name} (${agent.id})\n${formatAgentContextSections(agent.contextSections, {
+      soul: 320,
+      rules: 420,
+      tools: 180,
+      memory: 260,
+      recentMemory: 320
+    })}`)
     .join("\n\n");
   const conversationThread = threadFromParentRun(parentRun);
   const conversationText = formatConversationForContext(conversationThread, prompt);
@@ -2290,6 +3418,7 @@ async function buildTaskContext({ prompt, route, projectId, parentRun = null, pr
     prompt,
     project,
     documents,
+    agentDocuments,
     agents: selectedAgents,
     conversationThread,
     conversationText,
@@ -2385,6 +3514,7 @@ function modelRequestBody(config, { system, user, wireApi = config.wireApi, json
       ]
     };
     if (jsonMode) body.response_format = { type: "json_object" };
+    if (config.disableResponseStorage) body.store = false;
     return body;
   }
   if (wireApi === "anthropic") {
@@ -2459,6 +3589,7 @@ function shouldFailoverModelProfile(error) {
 }
 
 async function requestAiModel({ config, system, user, wireApi = config.wireApi, jsonMode = false, omitReasoning = false, omitStore = false }) {
+  config = { ...config, baseUrl: assertTrustedModelBaseUrl(config.baseUrl) };
   const endpoint = modelEndpoint(config, wireApi);
   const body = modelRequestBody(config, { system, user, wireApi, jsonMode, omitReasoning, omitStore });
   const headers = modelHeaders(config, wireApi);
@@ -2565,7 +3696,9 @@ function buildModelAttempts(config, expectJson = false) {
   }
   if (config.wireApi === "responses") {
     push({ wireApi: "responses", jsonMode: false, omitReasoning: true, omitStore: false });
-    push({ wireApi: "responses", jsonMode: false, omitReasoning: true, omitStore: true });
+    if (!config.disableResponseStorage) {
+      push({ wireApi: "responses", jsonMode: false, omitReasoning: true, omitStore: true });
+    }
     push({ wireApi: "chat", jsonMode: expectJson, omitReasoning: false, omitStore: false });
     if (expectJson) push({ wireApi: "chat", jsonMode: false, omitReasoning: false, omitStore: false });
   }
@@ -2677,17 +3810,6 @@ function extractJsonObject(text) {
     }
   }
   return null;
-}
-
-function normalizeRelativeProjectPath(relativePath) {
-  const value = String(relativePath || "")
-    .trim()
-    .replace(/\\/g, "/")
-    .replace(/^\/+/, "");
-  if (!value || path.isAbsolute(value) || value.split("/").some((part) => part === "..")) {
-    return "";
-  }
-  return path.posix.normalize(value).replace(/^\/+/, "");
 }
 
 function mapRequestedPathToAllowed(agentId, requestedPath) {
@@ -2816,10 +3938,8 @@ function buildAgentSystemPrompt(agent, deliverables) {
 
 function buildAgentUserPrompt({ runId, projectId, agent, prompt, reason, context, directorText, upstreamNotes }) {
   const deliverables = agentDeliverables[agent.id] || [];
-  const documentLines = (context.documents || [])
-    .filter((doc) => doc.state === "已连接" && doc.excerpt)
-    .slice(0, 6)
-    .map((doc) => `## ${doc.relativePath}\n${doc.excerpt}`)
+  const documentLines = (context.agentDocuments?.[agent.id] || [])
+    .map((doc) => `## ${doc.relativePath}\n${doc.content}`)
     .join("\n\n");
 
   return [
@@ -2830,7 +3950,7 @@ function buildAgentUserPrompt({ runId, projectId, agent, prompt, reason, context
     context.conversationText ? `# 连续对话记录\n${truncate(context.conversationText, 3500)}` : "",
     upstreamNotes.length ? `# 上游岗位接力摘要\n${upstreamNotes.join("\n\n")}` : "",
     `# 项目资料库关键摘录\n${documentLines || "当前没有可读取的正式项目文件摘录。"}`,
-    `# 岗位工作区规则摘录\n${truncate(agent.contextPreview || "", 1600)}`,
+    `# 岗位工作区规则与记忆\n${formatAgentContextSections(agent.contextSections)}`,
     `# 标准项目模板和团队上下文\n${truncate(context.text || "", 4200)}`,
     `# 本岗位交付物白名单\n${deliverables.map((item) => `- ${item}`).join("\n")}`,
     "# 输出要求\n只返回 JSON。files 至少覆盖所有非目录型交付物；目录型交付物在 notes 中给出需要生成或整理的素材版本要求。每个 file 使用 mode=replace，content 是完整正式文件正文。"
@@ -2848,7 +3968,7 @@ async function appendProjectFile(projectId, relativePath, content) {
   return path.relative(projectPath, filePath);
 }
 
-async function replaceProjectFile(projectId, relativePath, content) {
+async function replaceProjectFile(projectId, relativePath, content, versionLabel = "") {
   const resolvedProjectId = await requireProjectDirectory(projectId);
   const projectPath = resolveInside(projectsRoot, resolvedProjectId);
   const filePath = resolveInside(projectPath, relativePath);
@@ -2857,7 +3977,8 @@ async function replaceProjectFile(projectId, relativePath, content) {
   const finalContent = body.startsWith("#") || relativePath.endsWith(".csv")
     ? body
     : `# ${path.basename(relativePath)}\n\n${body}`;
-  await fsp.writeFile(filePath, `${finalContent}\n`, "utf8");
+  await backupProjectDocument(projectPath, relativePath, versionLabel || createRunId());
+  await atomicWriteText(filePath, `${finalContent}\n`);
   return path.relative(projectPath, filePath);
 }
 
@@ -2938,6 +4059,11 @@ async function appendAssetManifest(projectId, record) {
   const resolvedProjectId = await requireProjectDirectory(projectId);
   const projectPath = resolveInside(projectsRoot, resolvedProjectId);
   const manifestPath = await ensureAssetManifest(resolvedProjectId);
+  const versionMarker = record.versionId ? `<!-- asset-version:${record.versionId} -->` : "";
+  if (versionMarker) {
+    const existing = await readTextIfExists(manifestPath, 500_000);
+    if (existing.includes(versionMarker)) return path.relative(projectPath, manifestPath);
+  }
   const row = [
     new Date().toISOString(),
     record.type,
@@ -2948,7 +4074,7 @@ async function appendAssetManifest(projectId, record) {
     record.tool,
     String(record.prompt || "").replace(/\|/g, "/").replace(/\r?\n/g, " ").slice(0, 160)
   ];
-  await fsp.appendFile(manifestPath, `| ${row.join(" | ")} |\n`, "utf8");
+  await fsp.appendFile(manifestPath, `| ${row.join(" | ")} |${versionMarker ? ` ${versionMarker}` : ""}\n`, "utf8");
   return path.relative(projectPath, manifestPath);
 }
 
@@ -2978,7 +4104,7 @@ async function writeAgentPlannedFile({ projectId, runId, agent, prompt, filePlan
   }
 
   if (mode === "replace") {
-    return replaceProjectFile(projectId, relativePath, content);
+    return replaceProjectFile(projectId, relativePath, content, runId);
   }
 
   return appendProjectFile(projectId, relativePath, formatRunSection({
@@ -2990,16 +4116,105 @@ async function writeAgentPlannedFile({ projectId, runId, agent, prompt, filePlan
   }));
 }
 
+function draftManifestPath(projectId, runId) {
+  return resolveInside(projectRunsPath(projectId), runId, "DRAFT_MANIFEST.json");
+}
+
+async function readDraftManifest(projectId, runId) {
+  return readJsonIfExists(draftManifestPath(projectId, runId)).catch(() => null);
+}
+
+async function stageAgentDrafts({ projectId, runId, agent, prompt, files, summary }) {
+  const resolvedProjectId = await requireProjectDirectory(projectId);
+  const projectPath = resolveInside(projectsRoot, resolvedProjectId);
+  const runPath = resolveInside(projectRunsPath(resolvedProjectId), runId);
+  const draftsPath = resolveInside(runPath, "DRAFTS", agent.id);
+  await fsp.mkdir(draftsPath, { recursive: true, mode: 0o700 });
+  const manifestPath = draftManifestPath(resolvedProjectId, runId);
+  const existing = await readJsonIfExists(manifestPath).catch(() => null);
+  const manifest = existing || {
+    runId,
+    projectId: resolvedProjectId,
+    status: "pending",
+    createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+    entries: []
+  };
+  const plans = [
+    ...(files || []),
+    ...getDirectoryDeliverables(agent.id).map((relativePath) => ({
+      path: relativePath,
+      mode: "append",
+      content: summary,
+      kind: "directory_handoff"
+    }))
+  ];
+  const staged = [];
+  for (const [index, plan] of plans.entries()) {
+    const targetPath = plan.kind === "directory_handoff"
+      ? normalizeRelativeProjectPath(plan.path)
+      : resolveAgentOutputPath(agent.id, plan.path);
+    const content = normalizeText(plan.content || "").trim();
+    if (!targetPath || !content) continue;
+    const extension = path.posix.extname(targetPath) || ".md";
+    const draftRelativePath = path.posix.join("DRAFTS", agent.id, `${String(index + 1).padStart(2, "0")}-${cryptoRandom(6)}${extension}`);
+    const draftPath = resolveInside(runPath, draftRelativePath);
+    await atomicWriteText(draftPath, `${content}\n`);
+    const baseSnapshot = plan.kind === "directory_handoff"
+      ? null
+      : await projectFileSnapshot(projectPath, targetPath);
+    const entry = {
+      id: `${agent.id}-${index + 1}-${cryptoRandom(5)}`,
+      agentId: agent.id,
+      agentName: agent.name,
+      targetPath,
+      draftRelativePath,
+      mode: plan.mode === "append" ? "append" : "replace",
+      kind: plan.kind || "file",
+      status: "pending",
+      baseExists: baseSnapshot?.exists ?? null,
+      baseHash: baseSnapshot?.hash ?? null,
+      prompt: truncate(prompt, 500),
+      createdAt: new Date().toISOString()
+    };
+    manifest.entries.push(entry);
+    staged.push(entry);
+  }
+  manifest.status = manifest.entries.some((entry) => entry.status === "pending") ? "pending" : manifest.status;
+  manifest.updatedAt = new Date().toISOString();
+  await writeJson(manifestPath, manifest);
+  return staged;
+}
+
 async function runAgentModel({ runId, projectId, agent, prompt, reason, context, directorText, upstreamNotes, account = null }) {
   const deliverables = agentDeliverables[agent.id] || [];
   const system = buildAgentSystemPrompt(agent, deliverables);
   const baseUser = buildAgentUserPrompt({ runId, projectId, agent, prompt, reason, context, directorText, upstreamNotes });
-  let ai = await callAiModel({
-    system,
-    user: baseUser,
-    account,
-    expectJson: true
-  });
+  const fingerprint = (value) => {
+    const content = String(value || "");
+    return {
+      chars: content.length,
+      sha256: createHash("sha256").update(content).digest("hex")
+    };
+  };
+  const inputContextAudit = {
+    version: 1,
+    projectDocuments: fingerprintContextDocuments(context.agentDocuments?.[agent.id] || []),
+    workspaceContext: fingerprint(formatAgentContextSections(agent.contextSections)),
+    sharedContext: fingerprint(truncate(context.text || "", 4200)),
+    conversationContext: fingerprint(truncate(context.conversationText || "", 3500)),
+    requests: []
+  };
+  const callAgentModel = async (user, purpose) => {
+    inputContextAudit.requests.push({ purpose, system: fingerprint(system), user: fingerprint(user) });
+    try {
+      return await callAiModel({ system, user, account, expectJson: true });
+    } catch (error) {
+      if (error && typeof error === "object") error.inputContextAudit = inputContextAudit;
+      throw error;
+    }
+  };
+  let ai = await callAgentModel(baseUser, "initial");
   let plan = normalizeAgentFilePlan({
     agent,
     runId,
@@ -3019,12 +4234,7 @@ async function runAgentModel({ runId, projectId, agent, prompt, reason, context,
       "## 上一次无效输出",
       truncate(ai.text || "", 2200)
     ].join("\n\n");
-    ai = await callAiModel({
-      system,
-      user: repairUser,
-      account,
-      expectJson: true
-    });
+    ai = await callAgentModel(repairUser, "json_repair");
     plan = normalizeAgentFilePlan({
       agent,
       runId,
@@ -3038,12 +4248,14 @@ async function runAgentModel({ runId, projectId, agent, prompt, reason, context,
     const error = new Error(`${agent.name} model output was not valid JSON.`);
     error.status = 502;
     error.rawText = ai.text || "";
+    error.inputContextAudit = inputContextAudit;
     throw error;
   }
   if (!plan.files.length) {
     const error = new Error(`${agent.name} model output did not include writable project files.`);
     error.status = 502;
     error.rawText = ai.text || "";
+    error.inputContextAudit = inputContextAudit;
     throw error;
   }
   return {
@@ -3056,6 +4268,7 @@ async function runAgentModel({ runId, projectId, agent, prompt, reason, context,
     summary: plan.summary,
     files: plan.files,
     imageGenerationRequests: plan.imageGenerationRequests || [],
+    inputContext: inputContextAudit,
     rawText: ai.text || ""
   };
 }
@@ -3069,6 +4282,7 @@ async function runAgentModel({ runId, projectId, agent, prompt, reason, context,
  */
 async function postProcessAgentImageGeneration({ agentId, projectId, agentResult, runId }) {
   const generatedFiles = [];
+  if (!agentAssetGenerationEnabled) return generatedFiles;
   const stage = workflowStageForAgent(agentId);
   if (!stage) return generatedFiles;
 
@@ -3077,7 +4291,7 @@ async function postProcessAgentImageGeneration({ agentId, projectId, agentResult
   if (!shouldGenerate) return generatedFiles;
 
   // Path 1: Agent explicitly provided image_generation_requests in its JSON output
-  const requests = agentResult.imageGenerationRequests || [];
+  const requests = (agentResult.imageGenerationRequests || []).slice(0, maxAgentAssetRequests);
   if (requests.length > 0) {
     console.log(`[post-process] ${agentId} provided ${requests.length} image generation request(s) for project ${projectId}`);
     for (const req of requests) {
@@ -3278,7 +4492,8 @@ async function executeLocalAgentWork({ runId, projectId, route, context, prompt,
     const agentContext = (context.agents || []).find((item) => item.id === agentId) || {};
     const hydratedAgent = {
       ...agent,
-      contextPreview: agentContext.contextPreview || ""
+      contextPreview: agentContext.contextPreview || "",
+      contextSections: agentContext.contextSections || {}
     };
     const reason = reasonsByAgent.get(agentId);
     const stage = workflowStageForAgent(agentId);
@@ -3317,6 +4532,7 @@ async function executeLocalAgentWork({ runId, projectId, route, context, prompt,
         toolCalls: ["read_agent_workspace_context", "model_reasoning:error", "project_archive"],
         writtenFiles: [],
         summary: "",
+        inputContext: error?.inputContextAudit || null,
         rawText: truncate(error?.rawText || "", 2500)
       });
       upstreamNotes.push([
@@ -3327,59 +4543,72 @@ async function executeLocalAgentWork({ runId, projectId, route, context, prompt,
       continue;
     }
     const writtenFiles = [];
-
-    for (const filePlan of agentResult.files) {
-      const written = await writeAgentPlannedFile({
-        projectId,
-        runId,
-        agent,
-        prompt,
-        filePlan,
-        source: "agent_model"
-      });
-      if (written && !writtenFiles.includes(written)) writtenFiles.push(written);
-    }
-
-    for (const relativePath of getDirectoryDeliverables(agentId)) {
-      const written = await writeDirectoryHandoff(
-        projectId,
-        relativePath,
-        runId,
-        agent,
-        prompt,
-        agentResult.summary
-      );
-      if (written && !writtenFiles.includes(written)) writtenFiles.push(written);
-    }
-
-    // Post-process: auto-trigger image generation for casting/keyframe agents
-    try {
-      const generatedImages = await postProcessAgentImageGeneration({
-        agentId,
-        projectId,
-        agentResult,
-        runId
-      });
-      for (const imgPath of generatedImages) {
-        if (imgPath && !writtenFiles.includes(imgPath)) writtenFiles.push(imgPath);
+    let workStatus = agentResult.status;
+    if (autoApplyAgentFiles) {
+      for (const filePlan of agentResult.files) {
+        const written = await writeAgentPlannedFile({
+          projectId,
+          runId,
+          agent,
+          prompt,
+          filePlan,
+          source: "agent_model"
+        });
+        if (written && !writtenFiles.includes(written)) writtenFiles.push(written);
       }
-    } catch (postError) {
-      console.warn(`[post-process] Image generation post-processing failed for ${agentId}:`, postError?.message || postError);
+
+      for (const relativePath of getDirectoryDeliverables(agentId)) {
+        const written = await writeDirectoryHandoff(
+          projectId,
+          relativePath,
+          runId,
+          agent,
+          prompt,
+          agentResult.summary
+        );
+        if (written && !writtenFiles.includes(written)) writtenFiles.push(written);
+      }
+
+      // Generated assets are also a publication side effect, so they only run in explicit auto-apply mode.
+      try {
+        const generatedImages = await postProcessAgentImageGeneration({
+          agentId,
+          projectId,
+          agentResult,
+          runId
+        });
+        for (const imgPath of generatedImages) {
+          if (imgPath && !writtenFiles.includes(imgPath)) writtenFiles.push(imgPath);
+        }
+      } catch (postError) {
+        console.warn(`[post-process] Image generation post-processing failed for ${agentId}:`, postError?.message || postError);
+      }
+    } else {
+      const drafts = await stageAgentDrafts({
+        projectId,
+        runId,
+        agent,
+        prompt,
+        files: agentResult.files,
+        summary: agentResult.summary
+      });
+      writtenFiles.push(...drafts.map((draft) => draft.draftRelativePath));
+      workStatus = drafts.length ? "awaiting_approval" : agentResult.status;
     }
 
     const event = makeEvent({
       id: `agent-${agentId}`,
       label: `${agent.name}执行`,
       owner: agentId,
-      status: agentResult.status,
-      detail: `${stage ? `阶段 ${stage.order}「${stage.name}」：` : ""}${agent.name}已独立调用模型并写回 ${writtenFiles.length} 个正式项目交付物。${stage?.completionStandard ? `完成标准：${stage.completionStandard}` : ""}`,
+      status: workStatus,
+      detail: `${stage ? `阶段 ${stage.order}「${stage.name}」：` : ""}${agent.name}已独立调用模型并${autoApplyAgentFiles ? "写回正式项目" : "生成待审批草稿"} ${writtenFiles.length} 个交付物。${stage?.completionStandard ? `完成标准：${stage.completionStandard}` : ""}`,
       files: writtenFiles
     });
     agentEvents.push(event);
     agentRuns.push({
       agentId,
       name: agent.name,
-      status: agentResult.status,
+      status: workStatus,
       provider: agentResult.provider,
       model: agentResult.model,
       rawId: agentResult.rawId,
@@ -3387,18 +4616,19 @@ async function executeLocalAgentWork({ runId, projectId, route, context, prompt,
       toolCalls: [
         "read_agent_workspace_context",
         `model_reasoning:${agentResult.provider}/${agentResult.model}`,
-        "project_file_write",
+        autoApplyAgentFiles ? "project_file_write" : "run_draft_stage",
         ...(writtenFiles.some((f) => /\.(png|jpg|jpeg|webp)$/i.test(f)) ? ["dreamina_image_generate"] : []),
         "project_archive"
       ],
       writtenFiles,
       summary: agentResult.summary,
+      inputContext: agentResult.inputContext,
       rawText: truncate(agentResult.rawText, 2500)
     });
     upstreamNotes.push([
       `## ${agent.name}`,
-      `状态：${agentResult.status}`,
-      `写入：${writtenFiles.join(", ") || "无"}`,
+      `状态：${workStatus}`,
+      `${autoApplyAgentFiles ? "写入" : "草稿"}：${writtenFiles.join(", ") || "无"}`,
       truncate(agentResult.summary, 900)
     ].join("\n"));
   }
@@ -3416,6 +4646,7 @@ async function executeLocalAgentWork({ runId, projectId, route, context, prompt,
       writtenFiles: run.writtenFiles,
       toolCalls: run.toolCalls,
       summary: run.summary,
+      inputContext: run.inputContext,
       rawText: run.rawText
     };
   });
@@ -3471,12 +4702,12 @@ async function writeRunRecord({ runId, prompt, projectId, parentRunId, route, te
   ].join("\n");
 
   await Promise.all([
-    fsp.writeFile(path.join(runPath, "TASK.md"), taskText, "utf8"),
-    fsp.writeFile(path.join(runPath, "ROUTE.json"), `${JSON.stringify(routeRecord, null, 2)}\n`, "utf8"),
-    fsp.writeFile(path.join(runPath, "STATUS.json"), `${JSON.stringify(status, null, 2)}\n`, "utf8"),
-    fsp.writeFile(path.join(runPath, "AGENT_WORK.json"), `${JSON.stringify(agentWorkRecord, null, 2)}\n`, "utf8"),
-    fsp.writeFile(path.join(runPath, "AGENT_EVENTS.json"), `${JSON.stringify({ runId, projectId, parentRunId: parentRunId || null, events: agentEvents || [] }, null, 2)}\n`, "utf8"),
-    fsp.writeFile(path.join(runPath, "RESULT.md"), normalizeText(text), "utf8")
+    atomicWriteText(path.join(runPath, "TASK.md"), taskText),
+    atomicWriteText(path.join(runPath, "ROUTE.json"), `${JSON.stringify(routeRecord, null, 2)}\n`),
+    atomicWriteText(path.join(runPath, "STATUS.json"), `${JSON.stringify(status, null, 2)}\n`),
+    atomicWriteText(path.join(runPath, "AGENT_WORK.json"), `${JSON.stringify(agentWorkRecord, null, 2)}\n`),
+    atomicWriteText(path.join(runPath, "AGENT_EVENTS.json"), `${JSON.stringify({ runId, projectId, parentRunId: parentRunId || null, events: agentEvents || [] }, null, 2)}\n`),
+    atomicWriteText(path.join(runPath, "RESULT.md"), normalizeText(text))
   ]);
   if (parentRunId) {
     await appendChildRunIndex(parentRunId, {
@@ -3490,7 +4721,7 @@ async function writeRunRecord({ runId, prompt, projectId, parentRunId, route, te
 
   const files = runRecordFileNames.map((name) => ({
     name,
-    path: path.join(runPath, name),
+    path: path.relative(repoRoot, path.join(runPath, name)),
     relativePath: path.relative(repoRoot, path.join(runPath, name))
   }));
 
@@ -3515,7 +4746,8 @@ function buildFailedAgentWork(route, providerError) {
   }));
 }
 
-async function appendAgentRunMemory({ projectId, runId, route, prompt, directorText, agentWork, providerError }) {
+async function appendAgentRunMemory({ projectId, runId, route, prompt, directorText, agentWork, providerError, account = null }) {
+  if (!account?.id) return;
   const selected = new Set(["director", ...(route?.selectedAgents || [])]);
   const timestamp = shanghaiTimeKey();
   const dateKey = shanghaiDateKey(0);
@@ -3525,9 +4757,9 @@ async function appendAgentRunMemory({ projectId, runId, route, prompt, directorT
   await Promise.all([...selected].map(async (agentId) => {
     const agent = filmAgents.find((item) => item.id === agentId);
     if (!agent) return;
-    const workspace = resolveAgentWorkspace(agent);
-    const memoryDir = path.join(workspace, "memory");
-    await fsp.mkdir(memoryDir, { recursive: true });
+    const memoryDir = userAgentMemoryDirectory(account, agentId);
+    await fsp.mkdir(memoryDir, { recursive: true, mode: 0o700 });
+    await fsp.chmod(memoryDir, 0o700);
     const memoryPath = path.join(memoryDir, `${dateKey}.md`);
     const content = [
       `## ${timestamp} · Run ${runId}`,
@@ -3538,7 +4770,8 @@ async function appendAgentRunMemory({ projectId, runId, route, prompt, directorT
       directorText ? `- Director: ${truncate(directorText, 700).replace(/\r?\n/g, " ")}` : "",
       agentSummaries.get(agentId) ? `- ${agent.name}: ${truncate(agentSummaries.get(agentId), 700).replace(/\r?\n/g, " ")}` : ""
     ].filter(Boolean).join("\n");
-    await fsp.appendFile(memoryPath, `${content}\n\n`, "utf8");
+    await fsp.appendFile(memoryPath, `${content}\n\n`, { encoding: "utf8", mode: 0o600 });
+    await fsp.chmod(memoryPath, 0o600);
   }));
 }
 
@@ -3614,7 +4847,7 @@ async function renameProject(projectId, nextName) {
   return getProjectSummary(newProjectId);
 }
 
-async function processFilmTask({ prompt, requestedProjectId, parentRunId = null, account = null }) {
+async function processFilmTaskUnlocked({ prompt, requestedProjectId, parentRunId = null, account = null }) {
   let parentRun = null;
   if (parentRunId) {
     parentRun = await getRunDetailForUser(parentRunId, account);
@@ -3694,7 +4927,8 @@ async function processFilmTask({ prompt, requestedProjectId, parentRunId = null,
       prompt,
       directorText: text,
       agentWork: record.agentWork,
-      providerError: null
+      providerError: null,
+      account
     });
     const currentEvents = record.status.events;
     const threadEvents = Array.isArray(runDetail.threadEvents) && runDetail.threadEvents.length
@@ -3703,7 +4937,8 @@ async function processFilmTask({ prompt, requestedProjectId, parentRunId = null,
 
     return {
       ok: true,
-      degraded: false,
+      degraded: Boolean(record.status.degraded),
+      approvalRequired: Boolean(runDetail.approval?.required),
       providerError: null,
       provider: ai.config.provider,
       model: ai.config.model,
@@ -3719,7 +4954,8 @@ async function processFilmTask({ prompt, requestedProjectId, parentRunId = null,
       events: currentEvents,
       thread: runDetail.thread || [],
       threadEvents,
-      agentWork: record.agentWork
+      agentWork: record.agentWork,
+      approval: runDetail.approval
     };
   } catch (error) {
     const caught = error instanceof Error ? error : new Error(String(error));
@@ -3759,7 +4995,8 @@ async function processFilmTask({ prompt, requestedProjectId, parentRunId = null,
       prompt,
       directorText: "",
       agentWork: failedAgentWork,
-      providerError
+      providerError,
+      account
     });
     const currentEvents = record.status.events;
     const threadEvents = Array.isArray(runDetail.threadEvents) && runDetail.threadEvents.length
@@ -3789,6 +5026,40 @@ async function processFilmTask({ prompt, requestedProjectId, parentRunId = null,
   }
 }
 
+const projectTaskTails = new Map();
+let activeFilmTaskCount = 0;
+
+async function withProjectTaskLock(projectId, action) {
+  const key = String(projectId || "unknown");
+  const previous = projectTaskTails.get(key) || Promise.resolve();
+  let release;
+  const tail = new Promise((resolve) => { release = resolve; });
+  projectTaskTails.set(key, tail);
+  await previous;
+  try {
+    return await action();
+  } finally {
+    release();
+    if (projectTaskTails.get(key) === tail) projectTaskTails.delete(key);
+  }
+}
+
+async function processFilmTask(options) {
+  return withProjectTaskLock(options.requestedProjectId, async () => {
+    if (activeFilmTaskCount >= maxConcurrentFilmTasks) {
+      const error = new Error("The global film task concurrency limit has been reached.");
+      error.status = 429;
+      throw error;
+    }
+    activeFilmTaskCount += 1;
+    try {
+      return await processFilmTaskUnlocked(options);
+    } finally {
+      activeFilmTaskCount -= 1;
+    }
+  });
+}
+
 const filmTaskJobs = new Map();
 const filmTaskJobTtlMs = positiveNumberEnv("FILM_TASK_JOB_TTL_MS", 2 * 60 * 60 * 1000);
 
@@ -3801,6 +5072,53 @@ function cleanupFilmTaskJobs() {
   for (const [jobId, job] of filmTaskJobs.entries()) {
     if (now - new Date(job.updatedAt || job.createdAt || 0).getTime() > filmTaskJobTtlMs) {
       filmTaskJobs.delete(jobId);
+    }
+  }
+}
+
+function filmTaskJobPath(ownerUserId, jobId) {
+  return resolveInside(userDataRoot, ownerUserId, "jobs", `${jobId}.json`);
+}
+
+function persistedFilmTaskJob(job) {
+  const { account: _account, ...record } = job;
+  return record;
+}
+
+async function persistFilmTaskJob(job) {
+  if (!job?.ownerUserId) return;
+  const filePath = filmTaskJobPath(job.ownerUserId, job.jobId);
+  await fsp.mkdir(path.dirname(filePath), { recursive: true, mode: 0o700 });
+  await fsp.chmod(path.dirname(filePath), 0o700);
+  await writeJson(filePath, persistedFilmTaskJob(job));
+}
+
+async function loadFilmTaskJobForUser(user, jobId) {
+  if (!user?.id) return null;
+  const record = await readJsonIfExists(filmTaskJobPath(user.id, jobId)).catch(() => null);
+  if (!record || record.ownerUserId !== user.id || record.jobId !== jobId) return null;
+  filmTaskJobs.set(jobId, record);
+  return record;
+}
+
+async function recoverPersistedFilmTaskJobs() {
+  const userEntries = await fsp.readdir(userDataRoot, { withFileTypes: true }).catch(() => []);
+  for (const userEntry of userEntries) {
+    if (!userEntry.isDirectory()) continue;
+    const jobsPath = resolveInside(userDataRoot, userEntry.name, "jobs");
+    const jobEntries = await fsp.readdir(jobsPath, { withFileTypes: true }).catch(() => []);
+    for (const entry of jobEntries) {
+      if (!entry.isFile() || !entry.name.endsWith(".json")) continue;
+      const filePath = resolveInside(jobsPath, entry.name);
+      const job = await readJsonIfExists(filePath).catch(() => null);
+      if (!job?.jobId || job.ownerUserId !== userEntry.name) continue;
+      if (job.status === "queued" || job.status === "running") {
+        const endedAt = new Date().toISOString();
+        Object.assign(job, recoverInterruptedJob(job, endedAt));
+        await writeJson(filePath, job);
+      }
+      const age = Date.now() - new Date(job.updatedAt || job.createdAt || 0).getTime();
+      if (age <= filmTaskJobTtlMs) filmTaskJobs.set(job.jobId, job);
     }
   }
 }
@@ -3827,7 +5145,7 @@ function publicFilmTaskJob(job) {
   };
 }
 
-function startFilmTaskJob({ prompt, requestedProjectId, parentRunId = null, account = null }) {
+async function startFilmTaskJob({ prompt, requestedProjectId, parentRunId = null, account = null }) {
   cleanupFilmTaskJobs();
   const now = new Date().toISOString();
   const job = {
@@ -3847,11 +5165,15 @@ function startFilmTaskJob({ prompt, requestedProjectId, parentRunId = null, acco
     errorPayload: null
   };
   filmTaskJobs.set(job.jobId, job);
+  await persistFilmTaskJob(job);
 
   queueMicrotask(async () => {
     job.status = "running";
     job.startedAt = new Date().toISOString();
     job.updatedAt = job.startedAt;
+    await persistFilmTaskJob(job).catch((error) => {
+      console.warn("[film-task-job] unable to persist running state", error instanceof Error ? error.message : String(error));
+    });
     try {
       job.result = await processFilmTask({
         prompt,
@@ -3891,6 +5213,9 @@ function startFilmTaskJob({ prompt, requestedProjectId, parentRunId = null, acco
     } finally {
       job.endedAt = new Date().toISOString();
       job.updatedAt = job.endedAt;
+      await persistFilmTaskJob(job).catch((error) => {
+        console.warn("[film-task-job] unable to persist final state", error instanceof Error ? error.message : String(error));
+      });
     }
   });
 
@@ -3917,8 +5242,38 @@ function dreaminaRuntimeEnv() {
   };
 }
 
-function runDreamina(args, { timeoutMs = 10 * 60_000 } = {}) {
+let activeAssetTaskCount = 0;
+const activeAssetTasksByOwner = new Map();
+
+async function withAssetGenerationSlot(ownerUserId, action) {
+  const ownerKey = String(ownerUserId || "system");
+  const ownerCount = activeAssetTasksByOwner.get(ownerKey) || 0;
+  if (activeAssetTaskCount >= maxConcurrentAssetTasks || ownerCount >= maxConcurrentAssetTasksPerAccount) {
+    const error = new Error("The asset generation concurrency limit has been reached.");
+    error.status = 429;
+    throw error;
+  }
+  activeAssetTaskCount += 1;
+  activeAssetTasksByOwner.set(ownerKey, ownerCount + 1);
+  try {
+    return await action();
+  } finally {
+    activeAssetTaskCount -= 1;
+    const nextOwnerCount = (activeAssetTasksByOwner.get(ownerKey) || 1) - 1;
+    if (nextOwnerCount > 0) activeAssetTasksByOwner.set(ownerKey, nextOwnerCount);
+    else activeAssetTasksByOwner.delete(ownerKey);
+  }
+}
+
+function runDreamina(args, { timeoutMs = 10 * 60_000, signal = null } = {}) {
   return new Promise((resolve, reject) => {
+    if (signal?.aborted) {
+      const error = new Error("Dreamina task was cancelled.");
+      error.status = 499;
+      error.code = "ASSET_JOB_CANCELLED";
+      reject(error);
+      return;
+    }
     const child = spawn(dreaminaBin, args, {
       cwd: repoRoot,
       env: dreaminaRuntimeEnv(),
@@ -3926,22 +5281,62 @@ function runDreamina(args, { timeoutMs = 10 * 60_000 } = {}) {
     });
     let stdout = "";
     let stderr = "";
-    const timer = setTimeout(() => {
+    let outputBytes = 0;
+    let settled = false;
+    let killTimer = null;
+    const terminateChild = () => {
       child.kill("SIGTERM");
+      if (!killTimer) {
+        killTimer = setTimeout(() => child.kill("SIGKILL"), 5000);
+        killTimer.unref?.();
+      }
+    };
+    const rejectOnce = (error) => {
+      if (settled) return;
+      settled = true;
+      reject(error);
+    };
+    const abortHandler = () => {
+      terminateChild();
+      const error = new Error("Dreamina task was cancelled.");
+      error.status = 499;
+      error.code = "ASSET_JOB_CANCELLED";
+      rejectOnce(error);
+    };
+    signal?.addEventListener("abort", abortHandler, { once: true });
+    const timer = setTimeout(() => {
+      terminateChild();
       const error = new Error(`Dreamina CLI timed out after ${Math.round(timeoutMs / 1000)}s.`);
       error.status = 504;
-      reject(error);
+      rejectOnce(error);
     }, timeoutMs);
 
-    child.stdout.on("data", (chunk) => { stdout += chunk.toString("utf8"); });
-    child.stderr.on("data", (chunk) => { stderr += chunk.toString("utf8"); });
+    const appendOutput = (target, chunk) => {
+      outputBytes += chunk.length;
+      if (outputBytes > maxDreaminaOutputBytes) {
+        terminateChild();
+        const error = new Error("Dreamina CLI exceeded the allowed output size.");
+        error.status = 502;
+        rejectOnce(error);
+        return target;
+      }
+      return target + chunk.toString("utf8");
+    };
+    child.stdout.on("data", (chunk) => { stdout = appendOutput(stdout, chunk); });
+    child.stderr.on("data", (chunk) => { stderr = appendOutput(stderr, chunk); });
     child.on("error", (error) => {
       clearTimeout(timer);
+      if (killTimer) clearTimeout(killTimer);
+      signal?.removeEventListener("abort", abortHandler);
       error.status = error.code === "ENOENT" ? 503 : 500;
-      reject(error);
+      rejectOnce(error);
     });
     child.on("close", (code) => {
       clearTimeout(timer);
+      if (killTimer) clearTimeout(killTimer);
+      signal?.removeEventListener("abort", abortHandler);
+      if (settled) return;
+      settled = true;
       const output = [stdout, stderr].filter(Boolean).join("\n").trim();
       if (code === 0) {
         resolve({ stdout, stderr, output });
@@ -4013,6 +5408,7 @@ async function listMediaFiles(dirPath, allowedExtensions) {
         await walk(fullPath);
         continue;
       }
+      if (entry.isSymbolicLink()) continue;
       if (allowedExtensions.has(path.extname(entry.name).toLowerCase())) {
         const stat = await pathStats(fullPath);
         files.push({ path: fullPath, stat });
@@ -4023,8 +5419,8 @@ async function listMediaFiles(dirPath, allowedExtensions) {
   return files.sort((a, b) => (b.stat?.mtimeMs || 0) - (a.stat?.mtimeMs || 0)).map((item) => item.path);
 }
 
-async function queryDreaminaUntilDone(submitId, downloadDir, allowedExtensions) {
-  const deadline = Date.now() + Math.max(30, dreaminaPollSeconds) * 1000;
+async function queryDreaminaUntilDone(submitId, downloadDir, allowedExtensions, signal = null) {
+  const deadline = Date.now() + Math.max(testMode ? 1 : 30, dreaminaPollSeconds) * 1000;
   let lastPayload = null;
   let lastOutput = "";
   await fsp.mkdir(downloadDir, { recursive: true });
@@ -4034,7 +5430,7 @@ async function queryDreaminaUntilDone(submitId, downloadDir, allowedExtensions) 
       "query_result",
       `--submit_id=${submitId}`,
       `--download_dir=${downloadDir}`
-    ], { timeoutMs: 90_000 });
+    ], { timeoutMs: dreaminaQueryTimeoutMs, signal });
     lastOutput = result.output;
     lastPayload = parseDreaminaOutput(result.output);
     const status = dreaminaStatus(lastPayload, result.output);
@@ -4052,7 +5448,23 @@ async function queryDreaminaUntilDone(submitId, downloadDir, allowedExtensions) 
       error.payload = lastPayload;
       throw error;
     }
-    await new Promise((resolve) => setTimeout(resolve, 2000));
+    await new Promise((resolve, reject) => {
+      const cleanup = () => signal?.removeEventListener("abort", abort);
+      const timer = setTimeout(() => {
+        cleanup();
+        resolve();
+      }, 2000);
+      const abort = () => {
+        clearTimeout(timer);
+        cleanup();
+        const error = new Error("Dreamina task was cancelled.");
+        error.status = 499;
+        error.code = "ASSET_JOB_CANCELLED";
+        reject(error);
+      };
+      if (signal?.aborted) abort();
+      else signal?.addEventListener("abort", abort, { once: true });
+    });
   }
 
   const error = new Error(`Dreamina task did not finish before timeout. submit_id=${submitId}`);
@@ -4215,20 +5627,51 @@ async function writeAssetVersions(projectId, versions) {
   const resolvedProjectId = await resolveProjectId(projectId);
   const projectPath = resolveInside(projectsRoot, resolvedProjectId);
   const filePath = resolveInside(projectPath, "09_assets/asset_versions.json");
-  await fsp.mkdir(path.dirname(filePath), { recursive: true });
-  await fsp.writeFile(filePath, `${JSON.stringify({ versions }, null, 2)}\n`, "utf8");
+  const seen = new Set();
+  const uniqueVersions = versions.filter((version) => {
+    if (!version?.versionId || seen.has(version.versionId)) return false;
+    seen.add(version.versionId);
+    return true;
+  });
+  await writeJson(filePath, { versions: uniqueVersions });
   return path.relative(projectPath, filePath);
 }
 
-async function createAssetVersion({ projectId, action, type, relativePath, secondRelativePath = "", prompt }) {
+async function createAssetVersionUnlocked({
+  projectId,
+  action,
+  type,
+  relativePath,
+  secondRelativePath = "",
+  prompt,
+  signal = null,
+  resumeState = null,
+  onProgress = null
+}) {
+  const normalizedAction = String(action || "").trim();
+  const allowedActions = new Set([
+    "regenerate", "edit", "generate-image", "generate-video",
+    "text2image", "image2image", "text2video", "image2video", "frames2video"
+  ]);
+  if (!allowedActions.has(normalizedAction)) {
+    const error = new Error("Unsupported asset generation action.");
+    error.status = 400;
+    throw error;
+  }
   const resolvedProjectId = await resolveProjectId(projectId);
   const projectPath = resolveInside(projectsRoot, resolvedProjectId);
   const versions = await readAssetVersions(resolvedProjectId);
-  const parentRelativePath = relativePath || "";
+  const parentRelativePath = relativePath ? normalizeRelativeProjectPath(relativePath) : "";
+  if (relativePath && !parentRelativePath) {
+    const error = new Error("Invalid parent asset path.");
+    error.status = 400;
+    throw error;
+  }
   const sourceName = parentRelativePath ? path.basename(parentRelativePath) : `${type || "image"}-request`;
-  const versionNumber = versions.filter((item) => item.parentRelativePath === parentRelativePath).length + 1;
-  const versionId = `${new Date().toISOString().replace(/[:.]/g, "-")}-${cryptoRandom(4)}`;
-  const requestedType = type === "video" || action.includes("video") ? "video" : "image";
+  const versionNumber = Number(resumeState?.versionNumber)
+    || versions.filter((item) => item.parentRelativePath === parentRelativePath).length + 1;
+  const versionId = String(resumeState?.versionId || `${new Date().toISOString().replace(/[:.]/g, "-")}-${cryptoRandom(4)}`);
+  const requestedType = type === "video" || normalizedAction.includes("video") ? "video" : "image";
   const generationPrompt = truncate(
     normalizeText(prompt).trim() || await inferDreaminaPrompt({ projectId: resolvedProjectId, requestedType, parentRelativePath }),
     6000
@@ -4247,21 +5690,23 @@ async function createAssetVersion({ projectId, action, type, relativePath, secon
   let sourcePath = "";
   let lastPath = "";
   if (parentRelativePath) {
-    const candidate = resolveInside(projectPath, parentRelativePath);
-    const candidateStat = await pathStats(candidate);
-    const candidateExt = path.extname(candidate).toLowerCase();
-    if (candidateStat?.isFile() && [".png", ".jpg", ".jpeg", ".webp"].includes(candidateExt)) {
-      sourcePath = candidate;
+    const candidateExt = path.extname(parentRelativePath).toLowerCase();
+    if (![".png", ".jpg", ".jpeg", ".webp"].includes(candidateExt)) {
+      const error = new Error("Parent asset must be a supported project image.");
+      error.status = 415;
+      throw error;
     }
+    sourcePath = await resolveExistingFileInside(projectPath, parentRelativePath);
   }
   const normalizedSecondRelativePath = normalizeRelativeProjectPath(secondRelativePath);
   if (normalizedSecondRelativePath) {
-    const candidate = resolveInside(projectPath, normalizedSecondRelativePath);
-    const candidateStat = await pathStats(candidate);
-    const candidateExt = path.extname(candidate).toLowerCase();
-    if (candidateStat?.isFile() && [".png", ".jpg", ".jpeg", ".webp"].includes(candidateExt)) {
-      lastPath = candidate;
+    const candidateExt = path.extname(normalizedSecondRelativePath).toLowerCase();
+    if (![".png", ".jpg", ".jpeg", ".webp"].includes(candidateExt)) {
+      const error = new Error("Second asset must be a supported project image.");
+      error.status = 415;
+      throw error;
     }
+    lastPath = await resolveExistingFileInside(projectPath, normalizedSecondRelativePath);
   }
 
   const dreamina = dreaminaCommandForAsset({
@@ -4270,35 +5715,72 @@ async function createAssetVersion({ projectId, action, type, relativePath, secon
     lastPath,
     prompt: generationPrompt
   });
-  const submitResult = await runDreamina(dreamina.args, { timeoutMs: 120_000 });
-  const submitPayload = parseDreaminaOutput(submitResult.output);
-  const submitId = dreaminaSubmitId(submitPayload, submitResult.output);
+  let submitId = String(resumeState?.submitId || "");
   if (!submitId) {
-    const error = new Error(`Dreamina did not return submit_id. Output: ${truncate(submitResult.output, 800)}`);
-    error.status = 502;
-    error.payload = submitPayload;
-    throw error;
-  }
-  const submitStatus = dreaminaStatus(submitPayload, submitResult.output);
-  if (isDreaminaFailureStatus(submitStatus)) {
-    const error = new Error(`Dreamina task failed: ${dreaminaFailReason(submitPayload, submitResult.output)}`);
-    error.status = 502;
-    error.payload = submitPayload;
-    throw error;
+    const submitResult = await runDreamina(dreamina.args, { timeoutMs: dreaminaSubmitTimeoutMs, signal });
+    const submitPayload = parseDreaminaOutput(submitResult.output);
+    submitId = dreaminaSubmitId(submitPayload, submitResult.output);
+    if (!submitId) {
+      const error = new Error(`Dreamina did not return submit_id. Output: ${truncate(submitResult.output, 800)}`);
+      error.status = 502;
+      error.payload = submitPayload;
+      throw error;
+    }
+    const submitStatus = dreaminaStatus(submitPayload, submitResult.output);
+    if (isDreaminaFailureStatus(submitStatus)) {
+      const error = new Error(`Dreamina task failed: ${dreaminaFailReason(submitPayload, submitResult.output)}`);
+      error.status = 502;
+      error.payload = submitPayload;
+      throw error;
+    }
+    await onProgress?.({
+      phase: "submitted",
+      submitId,
+      versionId,
+      versionNumber,
+      requestedType,
+      updatedAt: new Date().toISOString()
+    });
   }
 
   const downloadDir = resolveInside(projectPath, path.join("09_assets", "raw", `dreamina-${versionId}`));
-  const query = await queryDreaminaUntilDone(submitId, downloadDir, dreamina.allowedExtensions);
-  const movedFiles = await moveDreaminaDownloads({
-    downloaded: query.downloaded,
-    projectPath,
-    outputDir,
-    sourceName,
-    action,
-    versionNumber,
-    versionId
-  });
-  await fsp.rm(downloadDir, { recursive: true, force: true }).catch(() => {});
+  let query = resumeState?.providerPayload ? { payload: resumeState.providerPayload } : null;
+  const resumedMovedFiles = Array.isArray(resumeState?.movedFiles) ? resumeState.movedFiles : [];
+  let movedFiles = resumedMovedFiles.length && resumedMovedFiles.every((file) => (
+    file?.relativePath && fs.existsSync(resolveInside(projectPath, file.relativePath))
+  )) ? resumedMovedFiles : [];
+  if (!movedFiles.length) {
+    try {
+      query = await queryDreaminaUntilDone(submitId, downloadDir, dreamina.allowedExtensions, signal);
+      movedFiles = await moveDreaminaDownloads({
+        downloaded: query.downloaded,
+        projectPath,
+        outputDir,
+        sourceName,
+        action: normalizedAction,
+        versionNumber,
+        versionId
+      });
+      await onProgress?.({
+        phase: "moved",
+        submitId,
+        versionId,
+        versionNumber,
+        requestedType,
+        movedFiles: movedFiles.map(({ relativePath: movedRelativePath, name }) => ({ relativePath: movedRelativePath, name })),
+        providerPayload: query.payload,
+        updatedAt: new Date().toISOString()
+      });
+    } finally {
+      await fsp.rm(downloadDir, { recursive: true, force: true }).catch(() => {});
+    }
+  }
+  if (signal?.aborted) {
+    const error = new Error("Dreamina task was cancelled.");
+    error.status = 499;
+    error.code = "ASSET_JOB_CANCELLED";
+    throw error;
+  }
   if (!movedFiles.length) {
     const error = new Error(`Dreamina task succeeded but no media file was downloaded. submit_id=${submitId}`);
     error.status = 502;
@@ -4310,7 +5792,7 @@ async function createAssetVersion({ projectId, action, type, relativePath, secon
     versionId,
     projectId: resolvedProjectId,
     type: requestedType,
-    action,
+    action: normalizedAction,
     relativePath: primary.relativePath,
     files: movedFiles.map((file) => file.relativePath),
     parentRelativePath,
@@ -4320,7 +5802,7 @@ async function createAssetVersion({ projectId, action, type, relativePath, secon
     submitId,
     prompt: generationPrompt,
     command: dreamina.args.map((arg) => arg.startsWith("--prompt=") ? "--prompt=[redacted]" : arg),
-    providerPayload: query.payload,
+    providerPayload: query?.payload || null,
     createdAt: new Date().toISOString()
   };
 
@@ -4329,10 +5811,243 @@ async function createAssetVersion({ projectId, action, type, relativePath, secon
 
   return {
     ...record,
-    path: primary.path,
+    path: primary.relativePath,
     name: primary.name,
     url: `/api/film/projects/${encodeURIComponent(resolvedProjectId)}/assets/${primary.relativePath.split("/").map(encodeURIComponent).join("/")}`
   };
+}
+
+async function createAssetVersion(options) {
+  return withAssetGenerationSlot(options.ownerUserId, () => createAssetVersionUnlocked(options));
+}
+
+const assetTaskJobs = new Map();
+const assetTaskJobControllers = new Map();
+const assetTaskJobTtlMs = positiveNumberEnv("FILM_ASSET_JOB_TTL_MS", 24 * 60 * 60 * 1000);
+let assetSchedulerQueued = false;
+let runningAssetJobCount = 0;
+const runningAssetJobsByOwner = new Map();
+
+function createAssetTaskJobId() {
+  return `asset-job-${new Date().toISOString().replace(/[:.]/g, "-")}-${cryptoRandom(6)}`;
+}
+
+function assetTaskJobPath(ownerUserId, jobId) {
+  return resolveInside(userDataRoot, ownerUserId, "asset-jobs", `${jobId}.json`);
+}
+
+async function persistAssetTaskJob(job) {
+  const filePath = assetTaskJobPath(job.ownerUserId, job.jobId);
+  await fsp.mkdir(path.dirname(filePath), { recursive: true, mode: 0o700 });
+  await fsp.chmod(path.dirname(filePath), 0o700);
+  await writeJson(filePath, job);
+}
+
+function publicAssetTaskJob(job) {
+  return {
+    ok: true,
+    pending: ["queued", "running"].includes(job.status),
+    jobId: job.jobId,
+    status: job.status,
+    projectId: job.request?.projectId || null,
+    action: job.request?.action || null,
+    type: job.request?.type || null,
+    createdAt: job.createdAt,
+    updatedAt: job.updatedAt,
+    startedAt: job.startedAt || null,
+    endedAt: job.endedAt || null,
+    recoveryCount: Number(job.recoveryCount || 0),
+    cancelRequested: Boolean(job.cancelRequested),
+    progress: job.progress || { phase: "queued", percent: 0 },
+    result: job.status === "done" ? job.result : null,
+    error: job.status === "error" ? job.error : null
+  };
+}
+
+async function loadAssetTaskJobForUser(user, jobId) {
+  if (!user?.id) return null;
+  const cached = assetTaskJobs.get(jobId);
+  if (cached?.ownerUserId === user.id) return cached;
+  const record = await readJsonIfExists(assetTaskJobPath(user.id, jobId)).catch(() => null);
+  if (!record || record.ownerUserId !== user.id || record.jobId !== jobId) return null;
+  assetTaskJobs.set(jobId, record);
+  return record;
+}
+
+function scheduleAssetTaskJobs(delayMs = 0) {
+  if (delayMs > 0) {
+    const timer = setTimeout(() => scheduleAssetTaskJobs(), delayMs);
+    timer.unref?.();
+    return;
+  }
+  if (assetSchedulerQueued) return;
+  assetSchedulerQueued = true;
+  queueMicrotask(runAssetTaskScheduler);
+}
+
+function decrementRunningAssetJob(ownerUserId) {
+  runningAssetJobCount = Math.max(0, runningAssetJobCount - 1);
+  const next = Math.max(0, (runningAssetJobsByOwner.get(ownerUserId) || 1) - 1);
+  if (next) runningAssetJobsByOwner.set(ownerUserId, next);
+  else runningAssetJobsByOwner.delete(ownerUserId);
+}
+
+async function executeAssetTaskJob(job) {
+  const controller = new AbortController();
+  assetTaskJobControllers.set(job.jobId, controller);
+  try {
+    await persistAssetTaskJob(job);
+    const result = await withProjectTaskLock(job.request.projectId, () => createAssetVersion({
+      ...job.request,
+      ownerUserId: job.ownerUserId,
+      signal: controller.signal,
+      resumeState: job.progress,
+      onProgress: async (progress) => {
+        if (job.cancelRequested) controller.abort();
+        job.progress = {
+          ...progress,
+          percent: progress.phase === "moved" ? 85 : progress.phase === "submitted" ? 25 : 5
+        };
+        job.updatedAt = new Date().toISOString();
+        await persistAssetTaskJob(job);
+      }
+    }));
+    if (job.cancelRequested) {
+      job.status = "cancelled";
+      job.result = null;
+    } else {
+      job.status = "done";
+      job.result = result;
+      job.error = null;
+      job.progress = { phase: "done", percent: 100, updatedAt: new Date().toISOString() };
+    }
+    job.endedAt = new Date().toISOString();
+  } catch (error) {
+    if (job.cancelRequested || error?.code === "ASSET_JOB_CANCELLED") {
+      job.status = "cancelled";
+      job.error = null;
+      job.progress = { ...job.progress, phase: "cancelled", percent: job.progress?.percent || 0 };
+      job.endedAt = new Date().toISOString();
+    } else if (error?.status === 429) {
+      job.status = "queued";
+      job.availableAt = new Date(Date.now() + 500).toISOString();
+      job.progress = { ...job.progress, phase: job.progress?.phase || "queued" };
+    } else {
+      job.status = "error";
+      job.error = {
+        message: error instanceof Error ? error.message : String(error),
+        status: error?.status || 500,
+        code: error?.code || null
+      };
+      job.endedAt = new Date().toISOString();
+    }
+  } finally {
+    job.updatedAt = new Date().toISOString();
+    assetTaskJobControllers.delete(job.jobId);
+    decrementRunningAssetJob(job.ownerUserId);
+    await persistAssetTaskJob(job).catch((error) => {
+      console.warn("[asset-task-job] unable to persist final state", error instanceof Error ? error.message : String(error));
+    });
+    scheduleAssetTaskJobs(job.status === "queued" ? 500 : 0);
+  }
+}
+
+function runAssetTaskScheduler() {
+  assetSchedulerQueued = false;
+  const now = Date.now();
+  let nextAvailableAt = Infinity;
+  const queued = [...assetTaskJobs.values()]
+    .filter((job) => job.status === "queued" && !job.cancelRequested)
+    .sort((a, b) => String(a.createdAt).localeCompare(String(b.createdAt)));
+  for (const job of queued) {
+    const availableAt = Date.parse(job.availableAt || job.createdAt || "");
+    if (Number.isFinite(availableAt) && availableAt > now) {
+      nextAvailableAt = Math.min(nextAvailableAt, availableAt);
+      continue;
+    }
+    if (runningAssetJobCount >= maxConcurrentAssetTasks) break;
+    const ownerRunning = runningAssetJobsByOwner.get(job.ownerUserId) || 0;
+    if (ownerRunning >= maxConcurrentAssetTasksPerAccount) continue;
+    job.status = "running";
+    job.startedAt = job.startedAt || new Date().toISOString();
+    job.updatedAt = new Date().toISOString();
+    job.progress = job.progress?.submitId ? job.progress : { phase: "starting", percent: 5 };
+    runningAssetJobCount += 1;
+    runningAssetJobsByOwner.set(job.ownerUserId, ownerRunning + 1);
+    void executeAssetTaskJob(job);
+  }
+  if (nextAvailableAt !== Infinity) scheduleAssetTaskJobs(Math.max(10, nextAvailableAt - now));
+}
+
+function findAssetJobByIdempotency(ownerUserId, idempotencyKey) {
+  if (!idempotencyKey) return null;
+  return [...assetTaskJobs.values()].find((job) => (
+    job.ownerUserId === ownerUserId && job.idempotencyKey === idempotencyKey
+  )) || null;
+}
+
+async function startAssetTaskJob({ ownerUserId, request, idempotencyKey }) {
+  const normalizedKey = normalizeAssetIdempotencyKey(idempotencyKey);
+  const requestHash = assetRequestHash(request);
+  const existing = findAssetJobByIdempotency(ownerUserId, normalizedKey);
+  if (existing) {
+    if (existing.requestHash !== requestHash) {
+      const error = new Error("Idempotency-Key was already used for a different asset request.");
+      error.status = 409;
+      error.code = "IDEMPOTENCY_CONFLICT";
+      throw error;
+    }
+    return publicAssetTaskJob(existing);
+  }
+  const now = new Date().toISOString();
+  const job = {
+    version: 1,
+    jobId: createAssetTaskJobId(),
+    ownerUserId,
+    idempotencyKey: normalizedKey,
+    requestHash,
+    request,
+    status: "queued",
+    progress: { phase: "queued", percent: 0 },
+    createdAt: now,
+    updatedAt: now,
+    availableAt: now,
+    startedAt: null,
+    endedAt: null,
+    recoveryCount: 0,
+    cancelRequested: false,
+    result: null,
+    error: null
+  };
+  assetTaskJobs.set(job.jobId, job);
+  await persistAssetTaskJob(job);
+  scheduleAssetTaskJobs();
+  return publicAssetTaskJob(job);
+}
+
+async function recoverPersistedAssetTaskJobs() {
+  const userEntries = await fsp.readdir(userDataRoot, { withFileTypes: true }).catch(() => []);
+  for (const userEntry of userEntries) {
+    if (!userEntry.isDirectory()) continue;
+    const jobsPath = resolveInside(userDataRoot, userEntry.name, "asset-jobs");
+    const entries = await fsp.readdir(jobsPath, { withFileTypes: true }).catch(() => []);
+    for (const entry of entries) {
+      if (!entry.isFile() || !entry.name.endsWith(".json")) continue;
+      const filePath = resolveInside(jobsPath, entry.name);
+      const job = await readJsonIfExists(filePath).catch(() => null);
+      if (!job?.jobId || job.ownerUserId !== userEntry.name || !job.request?.projectId) continue;
+      if (job.status === "running") {
+        const recoveredAt = new Date().toISOString();
+        Object.assign(job, job.cancelRequested
+          ? { status: "cancelled", endedAt: recoveredAt, updatedAt: recoveredAt }
+          : recoverInterruptedAssetJob(job, recoveredAt));
+        await writeJson(filePath, job);
+      }
+      const age = Date.now() - new Date(job.updatedAt || job.createdAt || 0).getTime();
+      if (["queued", "running"].includes(job.status) || age <= assetTaskJobTtlMs) assetTaskJobs.set(job.jobId, job);
+    }
+  }
+  scheduleAssetTaskJobs();
 }
 
 async function getRuntimeSnapshot(projectId, user = null) {
@@ -4348,18 +6063,12 @@ async function getRuntimeSnapshot(projectId, user = null) {
     activeProjectId ? getProjectDocuments(activeProjectId) : [],
     activeProjectId ? getProjectWorkflowState(activeProjectId) : [],
     activeProjectId ? getProjectAssets(activeProjectId) : [],
-    getAgentMemoryAndSkills()
+    getAgentMemoryAndSkills(user)
   ]);
 
   return {
     ok: true,
     service: serviceName,
-    paths: {
-      repoRoot,
-      localAgentRoot,
-      filmWorkspacePath,
-      projectsRoot
-    },
     backend,
     agents,
     projects,
@@ -4397,30 +6106,58 @@ async function migrateUserOwnedData() {
     }));
 }
 
-await migrateLegacyProjectStorage();
-await reconcileProjectAliases();
-await normalizeAllProjectStructures();
-await migrateUserOwnedData();
+if (!testMode) {
+  await migrateLegacyProjectStorage();
+  await reconcileProjectAliases();
+  await normalizeAllProjectStructures();
+  await migrateUserOwnedData();
+}
+await recoverIncompleteApprovalJournals();
+await recoverIncompleteApprovalRollbacks();
+await recoverPersistedAssetTaskJobs();
+if (!testMode) await recoverPersistedFilmTaskJobs();
+
+app.use("/api/auth", (_req, res, next) => {
+  res.setHeader("Cache-Control", "no-store");
+  res.setHeader("Pragma", "no-cache");
+  next();
+});
+
+app.get("/api/auth/recovery/questions", (_req, res) => {
+  res.json({ ok: true, questions: recoveryQuestions });
+});
 
 app.get("/api/health", async (req, res) => {
-  const user = await authenticateRequest(req).catch(() => null);
-  const config = getAiConfig(user);
+  let user = null;
+  let authenticationReady = true;
+  try {
+    user = await authenticateRequest(req);
+  } catch {
+    authenticationReady = false;
+  }
   const backend = await getStudioStatus();
-  res.json({
-    ok: true,
+  res.status(authenticationReady ? 200 : 503).json({
+    ok: authenticationReady,
     service: serviceName,
     scope: user ? "user" : "global",
-    activeProfileId: config.id,
-    provider: config.provider,
-    model: config.model,
-    wireApi: config.wireApi,
-    hasApiKey: Boolean(config.apiKey),
-    backend
+    registrationEnabled,
+    authentication: { ready: authenticationReady },
+    backend: {
+      ok: backend.ok,
+      ready: backend.ready,
+      status: backend.status
+    }
   });
 });
 
 app.get("/api/auth/me", async (req, res) => {
-  const user = await authenticateRequest(req).catch(() => null);
+  let user;
+  try {
+    user = await authenticateRequest(req);
+  } catch (error) {
+    sendAuthServiceError(res, error);
+    return;
+  }
   if (!user) {
     res.status(401).json({ ok: false, user: null });
     return;
@@ -4428,88 +6165,300 @@ app.get("/api/auth/me", async (req, res) => {
   res.json({ ok: true, user: publicUser(user) });
 });
 
-app.post("/api/auth/register", async (req, res) => {
+app.post("/api/auth/register", registrationRateLimit, async (req, res) => {
+  if (!registrationEnabled) {
+    res.status(403).json({ ok: false, error: "Public registration is disabled. Ask an administrator for access." });
+    return;
+  }
   const email = normalizeEmail(req.body?.email);
   const password = String(req.body?.password || "");
   const repeatPassword = String(req.body?.repeatPassword || req.body?.passwordRepeat || "");
+  const recoveryQuestion = findRecoveryQuestion(req.body?.questionId);
+  const recoveryAnswer = normalizeRecoveryAnswer(req.body?.recoveryAnswer);
   if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
     res.status(400).json({ ok: false, error: "Valid email is required." });
     return;
   }
-  if (password.length < 6) {
-    res.status(400).json({ ok: false, error: "Password must be at least 6 characters." });
+  if (password.length < minimumPasswordLength) {
+    res.status(400).json({ ok: false, error: `Password must be at least ${minimumPasswordLength} characters.` });
     return;
   }
   if (password !== repeatPassword) {
     res.status(400).json({ ok: false, error: "Passwords do not match." });
     return;
   }
-
-  const record = readUsersSync();
-  if (record.users.some((user) => normalizeEmail(user.email) === email)) {
-    res.status(409).json({ ok: false, error: "Email is already registered." });
+  if (!recoveryQuestion || recoveryAnswer.length < minimumRecoveryAnswerLength || recoveryAnswer.length > 200) {
+    res.status(400).json({ ok: false, error: `A recovery question and answer between ${minimumRecoveryAnswerLength} and 200 characters are required.` });
     return;
   }
-  const passwordRecord = hashPassword(password);
-  const user = {
-    id: userIdFromEmail(email),
-    email,
-    passwordSalt: passwordRecord.salt,
-    passwordHash: passwordRecord.hash,
-    createdAt: new Date().toISOString()
-  };
-  record.users.push(user);
-  await writeUsers(record);
-  await fsp.mkdir(path.join(userDataRoot, user.id), { recursive: true });
-  await createUserSession(req, res, user.id);
-  res.status(201).json({ ok: true, user: publicUser(user) });
+
+  try {
+    const [passwordRecord, recoveryRecord] = await Promise.all([
+      hashPassword(password),
+      deriveRecoveryAnswerRecord(recoveryAnswer)
+    ]);
+    const user = await withUsersMutationLock(async () => {
+      const record = readUsersSync();
+      if (record.users.some((item) => normalizeEmail(item.email) === email)) return null;
+      const createdUser = {
+        id: userIdFromEmail(email),
+        email,
+        passwordSalt: passwordRecord.salt,
+        passwordHash: passwordRecord.hash,
+        recovery: {
+          questionId: recoveryQuestion.id,
+          answerSalt: recoveryRecord.salt,
+          answerHash: recoveryRecord.hash,
+          updatedAt: new Date().toISOString()
+        },
+        createdAt: new Date().toISOString()
+      };
+      record.users.push(createdUser);
+      await writeUsers(record);
+      return createdUser;
+    });
+    if (!user) {
+      res.status(409).json({ ok: false, error: "Email is already registered." });
+      return;
+    }
+    await fsp.mkdir(path.join(userDataRoot, user.id), { recursive: true, mode: 0o700 });
+    await fsp.chmod(path.join(userDataRoot, user.id), 0o700);
+    await createUserSession(req, res, user.id);
+    res.status(201).json({ ok: true, user: publicUser(user) });
+  } catch (error) {
+    sendAuthServiceError(res, error);
+  }
 });
 
-app.post("/api/auth/login", async (req, res) => {
+app.post("/api/auth/login", authRateLimit, authAccountRateLimit, async (req, res) => {
   const email = normalizeEmail(req.body?.email);
   const password = String(req.body?.password || "");
-  const record = readUsersSync();
-  const user = record.users.find((item) => normalizeEmail(item.email) === email);
-  if (!user || !verifyPassword(password, user)) {
-    res.status(401).json({ ok: false, error: "Invalid email or password." });
+  if (!email || !password || email.length > 254 || password.length > 1024) {
+    res.status(400).json({ ok: false, error: "Email and password are required." });
     return;
   }
-  await createUserSession(req, res, user.id);
-  res.json({ ok: true, user: publicUser(user) });
+  try {
+    const record = readUsersSync();
+    const user = record.users.find((item) => normalizeEmail(item.email) === email && !item.disabled);
+    if (!user) {
+      await hashPassword(password, "00000000000000000000000000000000");
+      res.status(401).json({ ok: false, error: "Invalid email or password." });
+      return;
+    }
+    if (!(await verifyPassword(password, user))) {
+      res.status(401).json({ ok: false, error: "Invalid email or password." });
+      return;
+    }
+    await createUserSession(req, res, user.id);
+    res.json({ ok: true, user: publicUser(user) });
+  } catch (error) {
+    sendAuthServiceError(res, error);
+  }
 });
 
-app.post("/api/auth/logout", requireAuth, async (req, res) => {
+app.post("/api/auth/logout", async (req, res) => {
   const token = parseCookies(req)[authCookieName];
-  const record = readUsersSync();
-  record.sessions = record.sessions.filter((session) => session.tokenHash !== sessionHash(token));
-  await writeUsers(record);
   clearSessionCookie(req, res);
-  res.json({ ok: true });
+  if (!token) {
+    res.json({ ok: true });
+    return;
+  }
+  try {
+    await withUsersMutationLock(async () => {
+      const record = readUsersSync();
+      record.sessions = record.sessions.filter((session) => session.tokenHash !== sessionHash(token));
+      await writeUsers(record);
+    });
+    res.json({ ok: true });
+  } catch (error) {
+    sendAuthServiceError(res, error);
+  }
+});
+
+app.post("/api/auth/password", requireAuth, passwordMutationRateLimit, async (req, res) => {
+  const currentPassword = String(req.body?.currentPassword || "");
+  const nextPassword = String(req.body?.nextPassword || "");
+  const repeatPassword = String(req.body?.repeatPassword || "");
+  if (nextPassword.length < minimumPasswordLength || nextPassword.length > 1024) {
+    res.status(400).json({ ok: false, error: `New password must be between ${minimumPasswordLength} and 1024 characters.` });
+    return;
+  }
+  if (nextPassword !== repeatPassword) {
+    res.status(400).json({ ok: false, error: "New passwords do not match." });
+    return;
+  }
+  try {
+    const passwordRecord = await hashPassword(nextPassword);
+    const updated = await withUsersMutationLock(async () => {
+      const record = readUsersSync();
+      const user = record.users.find((item) => item.id === req.user.id);
+      if (!user) throw new AuthStoreError("Authenticated user is missing from the authentication store.");
+      if (!(await verifyPassword(currentPassword, user))) return false;
+      user.passwordSalt = passwordRecord.salt;
+      user.passwordHash = passwordRecord.hash;
+      user.passwordUpdatedAt = new Date().toISOString();
+      record.sessions = record.sessions.filter((session) => session.userId !== user.id);
+      await writeUsers(record);
+      return true;
+    });
+    if (!updated) {
+      res.status(401).json({ ok: false, error: "Current password is incorrect." });
+      return;
+    }
+    clearSessionCookie(req, res);
+    await createUserSession(req, res, req.user.id);
+    res.json({ ok: true, user: publicUser(req.user) });
+  } catch (error) {
+    sendAuthServiceError(res, error);
+  }
+});
+
+app.post("/api/auth/recovery/setup", requireAuth, passwordMutationRateLimit, async (req, res) => {
+  const currentPassword = String(req.body?.currentPassword || "");
+  const question = findRecoveryQuestion(req.body?.questionId);
+  const answer = normalizeRecoveryAnswer(req.body?.answer);
+  if (!question) {
+    res.status(400).json({ ok: false, error: "Select a supported recovery question." });
+    return;
+  }
+  if (answer.length < minimumRecoveryAnswerLength || answer.length > 200) {
+    res.status(400).json({ ok: false, error: `Recovery answer must be between ${minimumRecoveryAnswerLength} and 200 characters.` });
+    return;
+  }
+  try {
+    const answerRecord = await deriveRecoveryAnswerRecord(answer);
+    const updated = await withUsersMutationLock(async () => {
+      const record = readUsersSync();
+      const user = record.users.find((item) => item.id === req.user.id);
+      if (!user) throw new AuthStoreError("Authenticated user is missing from the authentication store.");
+      if (!(await verifyPassword(currentPassword, user))) return false;
+      user.recovery = {
+        questionId: question.id,
+        answerSalt: answerRecord.salt,
+        answerHash: answerRecord.hash,
+        updatedAt: new Date().toISOString()
+      };
+      await writeUsers(record);
+      return true;
+    });
+    if (!updated) {
+      res.status(401).json({ ok: false, error: "Current password is incorrect." });
+      return;
+    }
+    res.json({ ok: true, recoveryConfigured: true, questionId: question.id });
+  } catch (error) {
+    sendAuthServiceError(res, error);
+  }
+});
+
+app.post("/api/auth/recovery/challenge", recoveryIpRateLimit, recoveryAccountRateLimit, async (req, res) => {
+  const email = normalizeEmail(req.body?.email);
+  if (!email || email.length > 254) {
+    res.status(400).json({ ok: false, error: "Valid email is required." });
+    return;
+  }
+  try {
+    const record = readUsersSync();
+    const user = record.users.find((item) => normalizeEmail(item.email) === email && !item.disabled);
+    const configuredQuestion = findRecoveryQuestion(user?.recovery?.questionId);
+    const fallbackIndex = Number.parseInt(createHash("sha256").update(email).digest("hex").slice(0, 8), 16) % recoveryQuestions.length;
+    const question = configuredQuestion || recoveryQuestions[fallbackIndex];
+    res.json({
+      ok: true,
+      available: true,
+      questionId: question.id,
+      question: question.question
+    });
+  } catch (error) {
+    sendAuthServiceError(res, error);
+  }
+});
+
+app.post("/api/auth/recovery/reset", recoveryIpRateLimit, recoveryAccountRateLimit, async (req, res) => {
+  const email = normalizeEmail(req.body?.email);
+  const answer = normalizeRecoveryAnswer(req.body?.answer);
+  const nextPassword = String(req.body?.nextPassword || "");
+  const repeatPassword = String(req.body?.repeatPassword || "");
+  if (!email || email.length > 254 || answer.length < 3 || answer.length > 200) {
+    res.status(400).json({ ok: false, error: "Email and recovery answer are required." });
+    return;
+  }
+  if (nextPassword.length < minimumPasswordLength || nextPassword.length > 1024) {
+    res.status(400).json({ ok: false, error: `New password must be between ${minimumPasswordLength} and 1024 characters.` });
+    return;
+  }
+  if (nextPassword !== repeatPassword) {
+    res.status(400).json({ ok: false, error: "New passwords do not match." });
+    return;
+  }
+  try {
+    const passwordRecord = await hashPassword(nextPassword);
+    const reset = await withUsersMutationLock(async () => {
+      const record = readUsersSync();
+      const user = record.users.find((item) => normalizeEmail(item.email) === email && !item.disabled);
+      const question = findRecoveryQuestion(user?.recovery?.questionId);
+      if (!user || !question || !user.recovery?.answerHash || !user.recovery?.answerSalt) {
+        await deriveRecoveryAnswerRecord(answer, "00000000000000000000000000000000");
+        return false;
+      }
+      if (!(await verifyRecoveryAnswerRecord(answer, user.recovery))) return false;
+      user.passwordSalt = passwordRecord.salt;
+      user.passwordHash = passwordRecord.hash;
+      user.passwordUpdatedAt = new Date().toISOString();
+      user.recovery.lastUsedAt = user.passwordUpdatedAt;
+      record.sessions = record.sessions.filter((session) => session.userId !== user.id);
+      await writeUsers(record);
+      return true;
+    });
+    if (!reset) {
+      res.status(401).json({ ok: false, error: "Unable to verify the recovery answer." });
+      return;
+    }
+    clearSessionCookie(req, res);
+    res.json({ ok: true, passwordReset: true });
+  } catch (error) {
+    sendAuthServiceError(res, error);
+  }
 });
 
 app.use("/api/config", requireAuth);
 app.use("/api/film", requireAuth);
 
 app.get("/api/config/status", (req, res) => {
-  const config = getAiConfig(req.user);
-  res.json({
-    activeProfileId: config.id,
-    name: config.name,
-    provider: config.provider,
-    model: config.model,
-    reasoningEffort: config.reasoningEffort,
-    baseUrl: config.baseUrl,
-    wireApi: config.wireApi,
-    authScheme: config.authScheme,
-    disableResponseStorage: config.disableResponseStorage,
-    apiKey: maskKey(config.apiKey),
-    hasApiKey: Boolean(config.apiKey),
-    workspace: filmWorkspacePath
-  });
+  try {
+    const config = getAiConfig(req.user);
+    res.json({
+      activeProfileId: config.id,
+      name: config.name,
+      provider: config.provider,
+      model: config.model,
+      reasoningEffort: config.reasoningEffort,
+      baseUrl: config.baseUrl,
+      wireApi: config.wireApi,
+      authScheme: config.authScheme,
+      disableResponseStorage: config.disableResponseStorage,
+      apiKey: maskKey(config.apiKey),
+      hasApiKey: Boolean(config.apiKey)
+    });
+  } catch (error) {
+    res.status(error?.status || 500).json({
+      ok: false,
+      error: "Unable to read model configuration.",
+      code: error?.code || "MODEL_CONFIG_UNAVAILABLE"
+    });
+  }
 });
 
-app.get("/api/config/models", (_req, res) => {
-  res.json({ ok: true, ...publicModelSettings(readModelSettingsSync(_req.user)) });
+app.get("/api/config/models", (req, res) => {
+  try {
+    res.json({ ok: true, ...publicModelSettings(readModelSettingsSync(req.user)) });
+  } catch (error) {
+    res.status(error?.status || 500).json({
+      ok: false,
+      error: "Unable to read model configuration.",
+      code: error?.code || "MODEL_CONFIG_UNAVAILABLE"
+    });
+  }
 });
 
 app.put("/api/config/models", async (req, res) => {
@@ -4583,7 +6532,7 @@ app.get("/api/film/projects", async (req, res) => {
   }
 });
 
-app.post("/api/film/projects", async (req, res) => {
+app.post("/api/film/projects", taskRateLimit, async (req, res) => {
   const title = String(req.body?.title || "").trim();
   const prompt = String(req.body?.prompt || title).trim();
 
@@ -4599,7 +6548,7 @@ app.post("/api/film/projects", async (req, res) => {
   }
 });
 
-app.patch("/api/film/projects/:projectId", async (req, res) => {
+app.patch("/api/film/projects/:projectId", projectMutationRateLimit, async (req, res) => {
   const projectId = String(req.params.projectId || "").trim();
   const name = String(req.body?.name || req.body?.title || "").trim();
   if (!name) {
@@ -4610,7 +6559,7 @@ app.patch("/api/film/projects/:projectId", async (req, res) => {
   try {
     const oldProjectId = await resolveProjectId(projectId);
     await requireProjectAccess(oldProjectId, req.user);
-    const project = await renameProject(oldProjectId, name);
+    const project = await withProjectTaskLock(oldProjectId, () => renameProject(oldProjectId, name));
     res.json({ ok: true, oldProjectId, projectId: project.id, project });
   } catch (error) {
     res.status(error?.status || 500).json({
@@ -4627,7 +6576,7 @@ app.get("/api/film/projects/:projectId/documents", async (req, res) => {
     await requireProjectAccess(projectId, req.user);
     res.json({ ok: true, projectId, documents: await getProjectDocuments(projectId) });
   } catch (error) {
-    res.status(500).json({
+    res.status(error?.status || 500).json({
       ok: false,
       error: "Unable to read project documents.",
       detail: error instanceof Error ? error.message : String(error)
@@ -4666,15 +6615,21 @@ app.get("/api/film/projects/:projectId/files/*relativePath", async (req, res) =>
   }
 });
 
-app.put("/api/film/projects/:projectId/files/*relativePath", async (req, res) => {
+app.put("/api/film/projects/:projectId/files/*relativePath", projectMutationRateLimit, async (req, res) => {
   try {
     const projectId = String(req.params.projectId || "").trim();
     const relativePath = Array.isArray(req.params.relativePath)
       ? req.params.relativePath.join("/")
       : String(req.params.relativePath || "").trim();
     const content = String(req.body?.content || "");
-    await requireProjectAccess(projectId, req.user);
-    res.json({ ok: true, file: await saveProjectFile(projectId, relativePath, content) });
+    const resolvedProjectId = await requireProjectAccess(projectId, req.user);
+    const file = await withProjectTaskLock(resolvedProjectId, () => saveProjectFile(
+      resolvedProjectId,
+      relativePath,
+      content,
+      req.headers["if-match"]
+    ));
+    res.json({ ok: true, file });
   } catch (error) {
     res.status(error?.status || 500).json({
       ok: false,
@@ -4698,7 +6653,7 @@ app.get("/api/film/projects/:projectId/assets", async (req, res) => {
   }
 });
 
-app.post("/api/film/projects/:projectId/assets/actions", async (req, res) => {
+app.post("/api/film/projects/:projectId/assets/actions", assetRateLimit, async (req, res) => {
   try {
     const projectId = String(req.params.projectId || "").trim();
     const action = String(req.body?.action || "regenerate").trim();
@@ -4706,16 +6661,89 @@ app.post("/api/film/projects/:projectId/assets/actions", async (req, res) => {
     const relativePath = String(req.body?.relativePath || "").trim();
     const secondRelativePath = String(req.body?.secondRelativePath || "").trim();
     const prompt = String(req.body?.prompt || "").trim();
-    await requireProjectAccess(projectId, req.user);
-    const asset = await createAssetVersion({ projectId, action, type, relativePath, secondRelativePath, prompt });
-    res.status(201).json({ ok: true, projectId, asset, assets: await getProjectAssets(projectId) });
+    if (!new Set(["regenerate", "edit", "generate-image", "generate-video"]).has(action)) {
+      res.status(400).json({ ok: false, error: "Unsupported asset action." });
+      return;
+    }
+    if (!new Set(["image", "video"]).has(type) || prompt.length > 6000) {
+      res.status(400).json({ ok: false, error: "Invalid asset type or prompt length." });
+      return;
+    }
+    const resolvedProjectId = await requireProjectAccess(projectId, req.user);
+    const request = {
+      projectId: resolvedProjectId,
+      action,
+      type,
+      relativePath,
+      secondRelativePath,
+      prompt
+    };
+    if (req.body?.background === true) {
+      const job = await startAssetTaskJob({
+        ownerUserId: req.user.id,
+        request,
+        idempotencyKey: req.headers["idempotency-key"] || req.body?.idempotencyKey
+      });
+      res.status(202).json(job);
+      return;
+    }
+    const asset = await withProjectTaskLock(resolvedProjectId, () => createAssetVersion({
+      ...request,
+      ownerUserId: req.user.id,
+    }));
+    res.status(201).json({ ok: true, projectId: resolvedProjectId, asset, assets: await getProjectAssets(resolvedProjectId) });
   } catch (error) {
     res.status(error?.status || 500).json({
       ok: false,
       error: "Unable to create asset version.",
-      detail: error instanceof Error ? error.message : String(error)
+      detail: error instanceof Error ? error.message : String(error),
+      code: error?.code || null
     });
   }
+});
+
+app.get("/api/film/asset-jobs/:jobId", async (req, res) => {
+  const job = await loadAssetTaskJobForUser(req.user, String(req.params.jobId || "").trim());
+  if (!job) {
+    res.status(404).json({ ok: false, error: "Asset task job not found." });
+    return;
+  }
+  res.json(publicAssetTaskJob(job));
+});
+
+app.get("/api/film/asset-jobs", async (req, res) => {
+  const projectId = String(req.query.project || "").trim();
+  const jobs = [...assetTaskJobs.values()]
+    .filter((job) => job.ownerUserId === req.user.id)
+    .filter((job) => !projectId || job.request?.projectId === projectId)
+    .sort((a, b) => String(b.updatedAt).localeCompare(String(a.updatedAt)))
+    .slice(0, 50)
+    .map(publicAssetTaskJob);
+  res.json({ ok: true, jobs });
+});
+
+app.delete("/api/film/asset-jobs/:jobId", projectMutationRateLimit, async (req, res) => {
+  const job = await loadAssetTaskJobForUser(req.user, String(req.params.jobId || "").trim());
+  if (!job) {
+    res.status(404).json({ ok: false, error: "Asset task job not found." });
+    return;
+  }
+  if (["done", "error"].includes(job.status)) {
+    res.status(409).json({ ok: false, error: "Completed asset jobs cannot be cancelled.", job: publicAssetTaskJob(job) });
+    return;
+  }
+  if (job.status !== "cancelled") {
+    job.cancelRequested = true;
+    job.updatedAt = new Date().toISOString();
+    if (job.status === "queued") {
+      job.status = "cancelled";
+      job.endedAt = job.updatedAt;
+      job.progress = { ...job.progress, phase: "cancelled" };
+    }
+    await persistAssetTaskJob(job);
+    assetTaskJobControllers.get(job.jobId)?.abort();
+  }
+  res.json(publicAssetTaskJob(job));
 });
 
 app.get("/api/film/projects/:projectId/assets/*relativePath", async (req, res) => {
@@ -4725,7 +6753,11 @@ app.get("/api/film/projects/:projectId/assets/*relativePath", async (req, res) =
       ? req.params.relativePath.join("/")
       : String(req.params.relativePath || "").trim();
     const projectPath = resolveInside(projectsRoot, projectId);
-    const assetPath = resolveInside(projectPath, relativePath);
+    const normalizedPath = assertAllowedMediaAssetPath(relativePath);
+    const assetPath = await resolveExistingFileInside(projectPath, normalizedPath);
+    res.setHeader("Content-Security-Policy", "default-src 'none'; sandbox");
+    res.setHeader("X-Content-Type-Options", "nosniff");
+    res.setHeader("Cache-Control", "private, max-age=3600");
     res.sendFile(assetPath);
   } catch (error) {
     res.status(error?.status || 404).json({
@@ -4738,7 +6770,7 @@ app.get("/api/film/projects/:projectId/assets/*relativePath", async (req, res) =
 
 app.get("/api/film/agents/memory", async (_req, res) => {
   try {
-    res.json({ ok: true, agents: await getAgentMemoryAndSkills() });
+    res.json({ ok: true, agents: await getAgentMemoryAndSkills(_req.user) });
   } catch (error) {
     res.status(500).json({
       ok: false,
@@ -4773,10 +6805,67 @@ app.get("/api/film/runs/:runId", async (req, res) => {
   }
 });
 
+app.post("/api/film/runs/:runId/approve", projectMutationRateLimit, async (req, res) => {
+  try {
+    const run = await decideRunDrafts({
+      runId: String(req.params.runId || "").trim(),
+      user: req.user,
+      decision: "approved",
+      entryIds: req.body?.entryIds
+    });
+    res.json({ ok: true, run });
+  } catch (error) {
+    res.status(error?.status || 500).json({
+      ok: false,
+      error: "Unable to approve run drafts.",
+      detail: error instanceof Error ? error.message : String(error),
+      code: error?.code || null
+    });
+  }
+});
+
+app.post("/api/film/runs/:runId/reject", projectMutationRateLimit, async (req, res) => {
+  try {
+    const run = await decideRunDrafts({
+      runId: String(req.params.runId || "").trim(),
+      user: req.user,
+      decision: "rejected",
+      entryIds: req.body?.entryIds
+    });
+    res.json({ ok: true, run });
+  } catch (error) {
+    res.status(error?.status || 500).json({
+      ok: false,
+      error: "Unable to reject run drafts.",
+      detail: error instanceof Error ? error.message : String(error),
+      code: error?.code || null
+    });
+  }
+});
+
+app.post("/api/film/runs/:runId/rollback", projectMutationRateLimit, async (req, res) => {
+  try {
+    const run = await rollbackApprovedDrafts({
+      runId: String(req.params.runId || "").trim(),
+      user: req.user,
+      journalId: String(req.body?.journalId || "").trim(),
+      entryIds: req.body?.entryIds
+    });
+    res.json({ ok: true, run });
+  } catch (error) {
+    res.status(error?.status || 500).json({
+      ok: false,
+      error: "Unable to roll back approved drafts.",
+      detail: error instanceof Error ? error.message : String(error),
+      code: error?.code || null
+    });
+  }
+});
+
 app.get("/api/film/jobs/:jobId", async (req, res) => {
   cleanupFilmTaskJobs();
   const jobId = String(req.params.jobId || "").trim();
-  const job = filmTaskJobs.get(jobId);
+  const job = filmTaskJobs.get(jobId) || await loadFilmTaskJobForUser(req.user, jobId);
   if (!job || job.ownerUserId !== req.user.id) {
     res.status(404).json({ ok: false, error: "Film task job not found." });
     return;
@@ -4784,7 +6873,7 @@ app.get("/api/film/jobs/:jobId", async (req, res) => {
   res.json(publicFilmTaskJob(job));
 });
 
-app.post("/api/film/task", async (req, res) => {
+app.post("/api/film/task", taskRateLimit, async (req, res) => {
   const prompt = String(req.body?.prompt || "").trim();
   const requestedProjectId = String(req.body?.projectId || "").trim();
 
@@ -4799,7 +6888,7 @@ app.post("/api/film/task", async (req, res) => {
 
   try {
     if (req.body?.background === true) {
-      res.status(202).json(startFilmTaskJob({ prompt, requestedProjectId, account: req.user }));
+      res.status(202).json(await startFilmTaskJob({ prompt, requestedProjectId, account: req.user }));
       return;
     }
     res.json(await processFilmTask({ prompt, requestedProjectId, account: req.user }));
@@ -4824,7 +6913,7 @@ app.post("/api/film/task", async (req, res) => {
   }
 });
 
-app.post("/api/film/runs/:runId/continue", async (req, res) => {
+app.post("/api/film/runs/:runId/continue", taskRateLimit, async (req, res) => {
   const prompt = String(req.body?.prompt || "").trim();
   const requestedProjectId = String(req.body?.projectId || "").trim();
   const parentRunId = String(req.params.runId || "").trim();
@@ -4840,7 +6929,7 @@ app.post("/api/film/runs/:runId/continue", async (req, res) => {
 
   try {
     if (req.body?.background === true) {
-      res.status(202).json(startFilmTaskJob({ prompt, requestedProjectId, parentRunId, account: req.user }));
+      res.status(202).json(await startFilmTaskJob({ prompt, requestedProjectId, parentRunId, account: req.user }));
       return;
     }
     res.json(await processFilmTask({ prompt, requestedProjectId, parentRunId, account: req.user }));
@@ -4880,10 +6969,12 @@ if (fs.existsSync(distPath)) {
   });
 }
 
-await backfillConversationArchives().catch((error) => {
-  console.warn("Unable to backfill conversation archives:", error instanceof Error ? error.message : String(error));
-});
+if (!testMode) {
+  await backfillConversationArchives().catch((error) => {
+    console.warn("Unable to backfill conversation archives:", error instanceof Error ? error.message : String(error));
+  });
+}
 
-app.listen(port, "0.0.0.0", () => {
-  console.log(`Film Studio listening on http://0.0.0.0:${port}`);
+app.listen(port, bindHost, () => {
+  console.log(`Film Studio listening on http://${bindHost}:${port}`);
 });

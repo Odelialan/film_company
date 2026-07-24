@@ -1,9 +1,22 @@
 ﻿# === 依赖 ===
 node_modules/
+.venv/
+venv/
+env/
+virtualenv/
+__pycache__/
+*.py[cod]
 
 # === 构建产物 ===
 dist/
 tsconfig.tsbuildinfo
+coverage/
+.nyc_output/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+test-results/
+playwright-report/
 
 # === 环境变量 / API Key ===
 .env
@@ -14,6 +27,8 @@ server/model-config.json
 
 # === 用户数据 ===
 server/users.json
+server/users.backup.json
+server/users.json.backup
 server/user-data/
 
 # === 项目用户数据（运行时生成） ===
@@ -46,12 +61,17 @@ agent/**/*.mp4
 agent/**/*.mov
 agent/**/*.webm
 agent/**/*.webp
-# public/assets 中超过 1MB 的大图
+
+# public/assets 中超过 1MB、且运行不依赖的预览大图
 public/assets/polly.png
 public/assets/slide-scene.png
 
-# === 说明文档（非必要） ===
-docs/
+# === 内部整改文档与 Agent 临时任务记录（非运行必需） ===
+/docs/
+agent/**/findings.md
+agent/**/progress.md
+agent/**/task_plan.md
+agent/**/plans/
 
 # === IDE / 编辑器 ===
 .vscode/

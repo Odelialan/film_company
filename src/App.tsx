@@ -1,6 +1,6 @@
 ﻿import type { CSSProperties } from "react";
 import { useEffect, useMemo, useState } from "react";
-import { ArrowRight, CheckCircle2, CircleDot, Command, FileCheck2, Folder, Image as ImageIcon, Loader2, MessageSquareText, Play, Plus, Radio, RefreshCw, Search, Send, Server, SlidersHorizontal, Video, X } from "lucide-react";
+import { ArrowRight, CheckCircle2, CircleDot, Command, FileCheck2, Folder, Image as ImageIcon, KeyRound, Loader2, MessageSquareText, Play, Plus, Radio, RefreshCw, Search, Send, Server, SlidersHorizontal, Video, X } from "lucide-react";
 import { agents, assets, documents, loopSteps, nav, quickActions, stages } from "./data/studio";
 
 const statusText = {
@@ -261,9 +261,15 @@ type UserAccount = {
   id: string;
   email: string;
   createdAt?: string | null;
+  recoveryConfigured?: boolean;
 };
 
-type AuthMode = "login" | "register";
+type AuthMode = "login" | "register" | "recover";
+
+type RecoveryQuestion = {
+  id: string;
+  question: string;
+};
 
 type ModelConnectionEntry = {
   key: string;
@@ -295,13 +301,61 @@ type WorkEvent = {
   id: string;
   label: string;
   owner: string;
-  status: "pending" | "running" | "done" | "degraded" | "error";
+  status: "pending" | "running" | "done" | "degraded" | "error" | "awaiting_approval" | "rejected";
   detail: string;
   files?: string[];
   startedAt?: string;
   endedAt?: string;
   runId?: string;
   runLabel?: string;
+};
+
+type ApprovalEntry = {
+  id: string;
+  agentId: string;
+  agentName: string;
+  targetPath: string;
+  mode: "append" | "replace";
+  kind: "file" | "directory_handoff";
+  status: string;
+  currentContent: string;
+  draftContent: string;
+  conflicted?: boolean;
+  currentHash?: string | null;
+  diff?: {
+    beforeHash: string;
+    afterHash: string;
+    beforeLineCount: number;
+    afterLineCount: number;
+    added: number;
+    removed: number;
+    truncated: boolean;
+    lines: Array<{
+      type: "context" | "add" | "remove";
+      text: string;
+      oldLine: number | null;
+      newLine: number | null;
+    }>;
+  };
+};
+
+type ApprovalState = {
+  required: boolean;
+  status: string;
+  entries: ApprovalEntry[];
+  decidedAt?: string | null;
+  rollback?: {
+    available: boolean;
+    status?: string | null;
+    rollbackId?: string | null;
+    error?: string | null;
+    candidates: Array<{
+      journalId: string;
+      entryId: string;
+      targetPath: string;
+      decidedAt?: string | null;
+    }>;
+  };
 };
 
 type AgentWork = {
@@ -343,6 +397,7 @@ type WorkbenchState = {
   events: WorkEvent[];
   historyEvents: WorkEvent[];
   agentWork: AgentWork[];
+  approval?: ApprovalState;
   responseText?: string;
   messages: WorkMessage[];
 };
@@ -352,11 +407,11 @@ type ProjectFileState = {
   relativePath: string;
   content: string;
   previewHtml: string;
+  contentHash: string;
   updatedAt?: string;
 };
 
 export function App() {
-  const activeStage = stages[4];
   const [promptIndex, setPromptIndex] = useState(0);
   const [prompt, setPrompt] = useState(defaultPrompt);
   const [runtime, setRuntime] = useState<RuntimeState | null>(null);
@@ -374,11 +429,25 @@ export function App() {
   const [modelDraft, setModelDraft] = useState<ModelProfile>(() => createEmptyModelProfile());
   const [modelListDraft, setModelListDraft] = useState<string[]>([""]);
   const [authChecked, setAuthChecked] = useState(false);
+  const [registrationEnabled, setRegistrationEnabled] = useState(false);
   const [authUser, setAuthUser] = useState<UserAccount | null>(null);
   const [authMode, setAuthMode] = useState<AuthMode>("login");
   const [authEmail, setAuthEmail] = useState("");
   const [authPassword, setAuthPassword] = useState("");
   const [authPasswordRepeat, setAuthPasswordRepeat] = useState("");
+  const [passwordPanelOpen, setPasswordPanelOpen] = useState(false);
+  const [currentPassword, setCurrentPassword] = useState("");
+  const [nextPassword, setNextPassword] = useState("");
+  const [nextPasswordRepeat, setNextPasswordRepeat] = useState("");
+  const [recoveryQuestions, setRecoveryQuestions] = useState<RecoveryQuestion[]>([]);
+  const [recoveryQuestionId, setRecoveryQuestionId] = useState("recovery_phrase");
+  const [recoveryAnswer, setRecoveryAnswer] = useState("");
+  const [recoveryCurrentPassword, setRecoveryCurrentPassword] = useState("");
+  const [recoveryChallenge, setRecoveryChallenge] = useState<{ questionId: string; question: string } | null>(null);
+  const [recoveryNextPassword, setRecoveryNextPassword] = useState("");
+  const [recoveryNextPasswordRepeat, setRecoveryNextPasswordRepeat] = useState("");
+  const [activeAssetJobId, setActiveAssetJobId] = useState("");
+  const [selectedApprovalEntryIds, setSelectedApprovalEntryIds] = useState<string[]>([]);
   const [task, setTask] = useState<TaskState>({
     status: "idle",
     message: "正在连接 Film Studio 后端运行时...",
@@ -406,6 +475,7 @@ export function App() {
 
   const docRows = runtime?.documents?.length ? runtime.documents : documents;
   const projectAssets = runtime?.assets || [];
+  const projectPreviewAsset = projectAssets.find((asset) => asset.type === "image");
   const agentMemoryRows = runtime?.agentMemory || [];
   const projectRows = runtime?.projects || [];
   const requestedProjectId = selectedProjectId || workbench.projectId || "";
@@ -413,6 +483,18 @@ export function App() {
   const requestedProjectIsKnown = !requestedProjectId || !projectsLoaded || projectRows.some((project) => project.id === requestedProjectId);
   const currentProjectId = (requestedProjectIsKnown ? requestedProjectId : "") || runtime?.activeProject?.id || projectRows[0]?.id || "";
   const currentProject = projectRows.find((project) => project.id === currentProjectId) || runtime?.activeProject || null;
+  const runtimeNextStage = runtime?.projectProgress?.nextStage;
+  const activeStage = runtimeNextStage ? {
+    title: runtimeNextStage.name,
+    owner: runtimeNextStage.owner,
+    artifact: runtimeNextStage.missingDeliverables?.join("、") || "阶段交付物",
+    gate: `完成 ${runtimeNextStage.completedDeliverables}/${runtimeNextStage.deliverableCount} 项交付物`
+  } : runtime?.projectProgress?.status === "done" ? {
+    title: "项目流程已完成",
+    owner: "总导演",
+    artifact: "交付、归档与复盘",
+    gate: "正式文件与资产均已通过阶段检查"
+  } : stages[0];
   const selectedFileIsKeyframe = Boolean(selectedFile?.relativePath?.startsWith("07_keyframes/"));
   const selectedFileGenerationPrompt = (fileDraft || selectedFile?.content || "").trim();
   const libraryEntries = useMemo(() => {
@@ -464,6 +546,26 @@ export function App() {
     const active = nextConfig.profiles.find((profile) => profile.id === nextConfig.activeProfileId) || nextConfig.profiles[0];
     if (active) setModelEditorDraft(active, nextConfig.profiles);
     return nextConfig;
+  }
+
+  async function loadRecoveryQuestions() {
+    const response = await apiFetch("/api/auth/recovery/questions");
+    const payload = await response.json().catch(() => ({}));
+    if (!response.ok || !Array.isArray(payload?.questions)) {
+      throw new Error(payload?.error || `HTTP ${response.status}`);
+    }
+    setRecoveryQuestions(payload.questions);
+    if (!payload.questions.some((item: RecoveryQuestion) => item.id === recoveryQuestionId) && payload.questions[0]?.id) {
+      setRecoveryQuestionId(payload.questions[0].id);
+    }
+    return payload.questions as RecoveryQuestion[];
+  }
+
+  async function openPasswordPanel() {
+    setPasswordPanelOpen(true);
+    await loadRecoveryQuestions().catch((error) => {
+      setTask({ status: "error", message: "无法读取验证问题。", meta: error instanceof Error ? error.message : String(error) });
+    });
   }
 
   function openModelSettings(profile = activeModelProfile) {
@@ -603,7 +705,10 @@ export function App() {
         const authResponse = await apiFetch("/api/auth/me");
         const authPayload = await authResponse.json().catch(() => ({}));
         if (!authResponse.ok || !authPayload?.user) {
+          const healthResponse = await apiFetch("/api/health").catch(() => null);
+          const healthPayload = healthResponse ? await healthResponse.json().catch(() => ({})) : {};
           if (!cancelled) {
+            setRegistrationEnabled(Boolean(healthPayload?.registrationEnabled));
             setAuthChecked(true);
             setTask({ status: "idle", message: "请先登录 Film Studio。", meta: "用户数据会按账户隔离保存" });
           }
@@ -655,7 +760,44 @@ export function App() {
     if (authUser?.id) saveWorkbench(workbench, authUser.id);
   }, [workbench, authUser?.id]);
 
+  useEffect(() => {
+    setSelectedApprovalEntryIds(
+      (workbench.approval?.entries || []).filter((entry) => entry.status === "pending").map((entry) => entry.id)
+    );
+  }, [workbench.runId, workbench.approval?.entries]);
+
+  useEffect(() => {
+    function handleExpiredSession() {
+      setAuthUser(null);
+      setRuntime(null);
+      setModelConfig(null);
+      setAuthChecked(true);
+      setView("home");
+      setTask({ status: "error", message: "登录会话已过期，请重新登录。", meta: "SESSION_EXPIRED" });
+    }
+    window.addEventListener("film-auth-expired", handleExpiredSession);
+    return () => window.removeEventListener("film-auth-expired", handleExpiredSession);
+  }, []);
+
   async function submitAuth() {
+    if (authMode === "recover") return;
+    if (authMode === "register" && !registrationEnabled) {
+      setTask({ status: "error", message: "公开注册已关闭，请联系管理员开通账户。" });
+      return;
+    }
+    const normalizedEmail = authEmail.trim().toLowerCase();
+    if (!normalizedEmail || !authPassword) {
+      setTask({ status: "error", message: "请输入邮箱和密码。" });
+      return;
+    }
+    if (authMode === "register" && authPassword.length < 12) {
+      setTask({ status: "error", message: "新账户密码至少需要 12 个字符。" });
+      return;
+    }
+    if (authMode === "register" && (!recoveryQuestionId || recoveryAnswer.trim().length < 8)) {
+      setTask({ status: "error", message: "请选择验证问题并填写至少 8 个字符的答案。" });
+      return;
+    }
     const endpoint = authMode === "register" ? "/api/auth/register" : "/api/auth/login";
     try {
       setTask({ status: "submitting", message: authMode === "register" ? "正在注册账户..." : "正在登录账户..." });
@@ -663,9 +805,11 @@ export function App() {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          email: authEmail,
+          email: normalizedEmail,
           password: authPassword,
-          repeatPassword: authPasswordRepeat
+          repeatPassword: authPasswordRepeat,
+          questionId: recoveryQuestionId,
+          recoveryAnswer
         })
       });
       const payload = await response.json().catch(() => ({}));
@@ -673,9 +817,17 @@ export function App() {
         setTask({ status: "error", message: payload?.error || "登录失败。", meta: payload?.detail || `HTTP ${response.status}` });
         return;
       }
-      const user = payload.user as UserAccount;
+      const sessionResponse = await apiFetch("/api/auth/me");
+      const sessionPayload = await sessionResponse.json().catch(() => ({}));
+      if (!sessionResponse.ok || !sessionPayload?.user) {
+        throw new Error("登录凭据已验证，但浏览器未能保存会话 Cookie。请确认使用 HTTPS 且未禁用本站 Cookie。");
+      }
+      const user = sessionPayload.user as UserAccount;
       const saved = loadSavedWorkbench(user.id);
       setAuthUser(user);
+      setAuthPassword("");
+      setAuthPasswordRepeat("");
+      setRecoveryAnswer("");
       setAuthChecked(true);
       if (saved) {
         setWorkbench(saved);
@@ -701,14 +853,162 @@ export function App() {
 
   async function logout() {
     await apiFetch("/api/auth/logout", { method: "POST" }).catch(() => null);
+    if (authUser?.id) window.localStorage.removeItem(userWorkbenchStorageKey(authUser.id));
     setAuthUser(null);
     setRuntime(null);
     setModelConfig(null);
     setWorkbench(createDraftWorkbench(defaultPrompt));
     setPrompt(defaultPrompt);
     setSelectedProjectId("");
+    setAuthPassword("");
+    setAuthPasswordRepeat("");
     setView("home");
     setTask({ status: "idle", message: "已退出登录。" });
+  }
+
+  async function requestRecoveryChallenge() {
+    const email = authEmail.trim().toLowerCase();
+    if (!email) {
+      setTask({ status: "error", message: "请输入需要恢复的账户邮箱。" });
+      return;
+    }
+    setTask({ status: "submitting", message: "正在读取账户验证问题..." });
+    try {
+      const response = await apiFetch("/api/auth/recovery/challenge", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ email })
+      });
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(payload?.error || `HTTP ${response.status}`);
+      if (!payload?.available || !payload?.question) {
+        setRecoveryChallenge(null);
+        setTask({ status: "error", message: "该账户尚未设置验证问题，无法自助重置密码。" });
+        return;
+      }
+      setRecoveryChallenge({ questionId: payload.questionId, question: payload.question });
+      setTask({ status: "idle", message: "请回答验证问题并设置新密码。" });
+    } catch (error) {
+      setTask({ status: "error", message: "无法读取验证问题。", meta: error instanceof Error ? error.message : String(error) });
+    }
+  }
+
+  async function resetForgottenPassword() {
+    if (!recoveryChallenge || recoveryAnswer.trim().length < 3 || recoveryNextPassword.length < 12 || recoveryNextPassword !== recoveryNextPasswordRepeat) {
+      setTask({ status: "error", message: "请填写验证答案；新密码至少 12 个字符且两次输入必须一致。" });
+      return;
+    }
+    setTask({ status: "submitting", message: "正在验证答案并重设密码..." });
+    try {
+      const response = await apiFetch("/api/auth/recovery/reset", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          email: authEmail.trim().toLowerCase(),
+          answer: recoveryAnswer,
+          nextPassword: recoveryNextPassword,
+          repeatPassword: recoveryNextPasswordRepeat
+        })
+      });
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(payload?.error || `HTTP ${response.status}`);
+      setRecoveryChallenge(null);
+      setRecoveryAnswer("");
+      setRecoveryNextPassword("");
+      setRecoveryNextPasswordRepeat("");
+      setAuthMode("login");
+      setTask({ status: "success", message: "密码已重设，所有旧登录会话均已撤销。请使用新密码登录。" });
+    } catch (error) {
+      setTask({ status: "error", message: "密码重设失败。", meta: error instanceof Error ? error.message : String(error) });
+    }
+  }
+
+  async function setupRecoveryQuestion() {
+    if (!recoveryCurrentPassword || recoveryAnswer.trim().length < 8 || !recoveryQuestionId) {
+      setTask({ status: "error", message: "请选择验证问题，并填写当前密码和至少 8 个字符的答案。" });
+      return;
+    }
+    setTask({ status: "submitting", message: "正在保存验证问题..." });
+    try {
+      const response = await apiFetch("/api/auth/recovery/setup", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ currentPassword: recoveryCurrentPassword, questionId: recoveryQuestionId, answer: recoveryAnswer })
+      });
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(payload?.error || `HTTP ${response.status}`);
+      setRecoveryCurrentPassword("");
+      setRecoveryAnswer("");
+      setAuthUser((current) => current ? { ...current, recoveryConfigured: true } : current);
+      setTask({ status: "success", message: "验证问题已保存。", meta: "答案仅以不可逆哈希保存" });
+    } catch (error) {
+      setTask({ status: "error", message: "验证问题保存失败。", meta: error instanceof Error ? error.message : String(error) });
+    }
+  }
+
+  async function changePassword() {
+    if (!currentPassword || nextPassword.length < 12 || nextPassword !== nextPasswordRepeat) {
+      setTask({
+        status: "error",
+        message: nextPassword !== nextPasswordRepeat ? "两次输入的新密码不一致。" : "请填写当前密码，新密码至少 12 个字符。"
+      });
+      return;
+    }
+    setTask({ status: "submitting", message: "正在更新登录密码并撤销旧会话..." });
+    try {
+      const response = await apiFetch("/api/auth/password", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ currentPassword, nextPassword, repeatPassword: nextPasswordRepeat })
+      });
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(payload?.error || payload?.detail || `HTTP ${response.status}`);
+      setCurrentPassword("");
+      setNextPassword("");
+      setNextPasswordRepeat("");
+      setPasswordPanelOpen(false);
+      setTask({ status: "success", message: "密码已更新，其他登录会话已撤销。", meta: "当前设备已重新签发会话" });
+    } catch (error) {
+      setTask({ status: "error", message: "密码修改失败。", meta: error instanceof Error ? error.message : String(error) });
+    }
+  }
+
+  function renderPasswordPanel() {
+    if (!passwordPanelOpen) return null;
+    return (
+      <div className="password-overlay" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) setPasswordPanelOpen(false); }}>
+        <div className="password-panel">
+          <div className="password-panel-head">
+            <div>
+              <p className="eyebrow">Account Security</p>
+              <h2>账户安全</h2>
+            </div>
+            <button className="icon-button" type="button" aria-label="关闭" onClick={() => setPasswordPanelOpen(false)}><X size={17} /></button>
+          </div>
+          <form className="security-section" onSubmit={(event) => { event.preventDefault(); void changePassword(); }}>
+            <h3>修改登录密码</h3>
+            <label><span>当前密码</span><input type="password" autoComplete="current-password" value={currentPassword} onChange={(event) => setCurrentPassword(event.target.value)} required /></label>
+            <label><span>新密码</span><input type="password" autoComplete="new-password" value={nextPassword} onChange={(event) => setNextPassword(event.target.value)} required minLength={12} maxLength={1024} /></label>
+            <label><span>重复新密码</span><input type="password" autoComplete="new-password" value={nextPasswordRepeat} onChange={(event) => setNextPasswordRepeat(event.target.value)} required minLength={12} maxLength={1024} /></label>
+            <p className="muted">成功后会撤销其他设备的全部登录会话，当前设备自动重新登录。</p>
+            <button className="primary-action" type="submit" disabled={task.status === "submitting"}>{task.status === "submitting" ? "更新中..." : "更新密码"}</button>
+          </form>
+          <form className="security-section" onSubmit={(event) => { event.preventDefault(); void setupRecoveryQuestion(); }}>
+            <h3>忘记密码验证问题</h3>
+            <p className="muted">状态：{authUser?.recoveryConfigured ? "已设置，可重新设置" : "尚未设置"}。答案仅保存不可逆哈希。</p>
+            <label>
+              <span>验证问题</span>
+              <select value={recoveryQuestionId} onChange={(event) => setRecoveryQuestionId(event.target.value)} required>
+                {recoveryQuestions.map((item) => <option value={item.id} key={item.id}>{item.question}</option>)}
+              </select>
+            </label>
+            <label><span>验证答案</span><input type="text" autoComplete="off" value={recoveryAnswer} onChange={(event) => setRecoveryAnswer(event.target.value)} required minLength={8} maxLength={200} /></label>
+            <label><span>当前登录密码</span><input type="password" autoComplete="current-password" value={recoveryCurrentPassword} onChange={(event) => setRecoveryCurrentPassword(event.target.value)} required /></label>
+            <button className="ghost-button" type="submit" disabled={task.status === "submitting"}>{authUser?.recoveryConfigured ? "重新设置验证问题" : "保存验证问题"}</button>
+          </form>
+        </div>
+      </div>
+    );
   }
 
   function rotatePrompt() {
@@ -910,6 +1210,83 @@ export function App() {
     await openHistoryRun(latestRun);
   }
 
+  async function refreshRunApproval() {
+    if (!workbench.runId) return null;
+    const response = await apiFetch(`/api/film/runs/${encodeURIComponent(workbench.runId)}`);
+    const payload = await response.json().catch(() => ({}));
+    if (!response.ok || !payload?.run) throw new Error(payload?.detail || payload?.error || `HTTP ${response.status}`);
+    const loaded = createWorkbenchFromRun(payload.run);
+    setWorkbench(loaded);
+    return loaded;
+  }
+
+  async function decideRunApproval(decision: "approve" | "reject", requestedEntryIds = selectedApprovalEntryIds) {
+    if (!workbench.runId || !workbench.approval?.required) return;
+    const entryIds = [...new Set(requestedEntryIds)].filter(Boolean);
+    if (!entryIds.length) {
+      setTask({ status: "error", message: "请至少选择一个待审批文件。" });
+      return;
+    }
+    setTask({
+      status: "submitting",
+      message: decision === "approve" ? "正在批准并发布 Agent 草稿..." : "正在拒绝 Agent 草稿...",
+      meta: `POST /api/film/runs/${workbench.runId}/${decision}`
+    });
+    try {
+      const response = await apiFetch(`/api/film/runs/${encodeURIComponent(workbench.runId)}/${decision}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ entryIds })
+      });
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok || !payload?.run) {
+        if (response.status === 409) await refreshRunApproval().catch(() => null);
+        throw new Error(`${payload?.detail || payload?.error || `HTTP ${response.status}`}${response.status === 409 ? "（审批状态已刷新）" : ""}`);
+      }
+      const loaded = createWorkbenchFromRun(payload.run);
+      setWorkbench(loaded);
+      if (loaded.projectId) await reloadRuntime(loaded.projectId);
+      setTask({
+        status: "success",
+        message: decision === "approve" ? `已批准并发布 ${entryIds.length} 个草稿。` : `已拒绝 ${entryIds.length} 个草稿。`,
+        meta: `run ${workbench.runId}`
+      });
+    } catch (error) {
+      setTask({
+        status: "error",
+        message: decision === "approve" ? "草稿批准失败。" : "草稿拒绝失败。",
+        meta: error instanceof Error ? error.message : String(error)
+      });
+    }
+  }
+
+  async function rollbackLatestApproval() {
+    if (!workbench.runId || !workbench.approval?.rollback?.available) return;
+    const candidates = workbench.approval.rollback.candidates;
+    const latestJournalId = candidates.at(-1)?.journalId;
+    const entryIds = candidates.filter((entry) => entry.journalId === latestJournalId).map((entry) => entry.entryId);
+    if (!latestJournalId || !entryIds.length) return;
+    setTask({ status: "submitting", message: "正在验证并回滚已发布文件...", meta: latestJournalId });
+    try {
+      const response = await apiFetch(`/api/film/runs/${encodeURIComponent(workbench.runId)}/rollback`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ journalId: latestJournalId, entryIds })
+      });
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok || !payload?.run) {
+        if (response.status === 409) await refreshRunApproval().catch(() => null);
+        throw new Error(payload?.detail || payload?.error || `HTTP ${response.status}`);
+      }
+      const loaded = createWorkbenchFromRun(payload.run);
+      setWorkbench(loaded);
+      if (loaded.projectId) await reloadRuntime(loaded.projectId);
+      setTask({ status: "success", message: `已安全回滚 ${entryIds.length} 个已发布文件。`, meta: latestJournalId });
+    } catch (error) {
+      setTask({ status: "error", message: "已发布文件回滚失败。", meta: error instanceof Error ? error.message : String(error) });
+    }
+  }
+
   async function submitPrompt() {
     const nextPrompt = prompt.trim();
     if (!nextPrompt) {
@@ -1064,18 +1441,30 @@ export function App() {
       || (selectedFileIsKeyframe ? selectedFileGenerationPrompt : "")
       || prompt.trim();
     setTask({ status: "submitting", message: "正在创建资产新版本...", meta: action });
+    const idempotencyKey = `asset-${Date.now()}-${Math.random().toString(36).slice(2, 12)}`;
     try {
       const response = await apiFetch(`/api/film/projects/${encodeURIComponent(projectId)}/assets/actions`, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: { "Content-Type": "application/json", "Idempotency-Key": idempotencyKey },
         body: JSON.stringify({
           action,
           type: requestedType,
           relativePath: asset?.relativePath || "",
-          prompt: generationPrompt
+          prompt: generationPrompt,
+          background: true
         })
       });
-      const payload = await response.json().catch(() => ({}));
+      let payload = await response.json().catch(() => ({}));
+      if (response.status === 202 && payload?.jobId) {
+        setActiveAssetJobId(payload.jobId);
+        payload = await waitForAssetTaskJob(payload.jobId, (job) => {
+          setTask({
+            status: "submitting",
+            message: `资产任务：${job.progress?.phase || job.status}`,
+            meta: `${job.progress?.percent || 0}% · ${job.jobId}`
+          });
+        });
+      }
       if (!response.ok || !payload?.asset) {
         setTask({ status: "error", message: payload?.error || "资产版本创建失败。", meta: payload?.detail || `HTTP ${response.status}` });
         return;
@@ -1084,7 +1473,20 @@ export function App() {
       setTask({ status: "success", message: "资产新版本已写入项目资料库。", meta: payload.asset.relativePath });
     } catch (error) {
       setTask({ status: "error", message: "无法创建资产版本。", meta: error instanceof Error ? error.message : String(error) });
+    } finally {
+      setActiveAssetJobId("");
     }
+  }
+
+  async function cancelActiveAssetJob() {
+    if (!activeAssetJobId) return;
+    const response = await apiFetch(`/api/film/asset-jobs/${encodeURIComponent(activeAssetJobId)}`, { method: "DELETE" });
+    const payload = await response.json().catch(() => ({}));
+    if (!response.ok) {
+      setTask({ status: "error", message: payload?.error || "无法取消资产任务。", meta: payload?.detail || `HTTP ${response.status}` });
+      return;
+    }
+    setTask({ status: "submitting", message: "正在取消资产任务...", meta: activeAssetJobId });
   }
 
   async function openProjectFile(relativePath?: string) {
@@ -1111,7 +1513,7 @@ export function App() {
     try {
       const response = await apiFetch(`/api/film/projects/${encodeURIComponent(projectId)}/files/${selectedFile.relativePath.split("/").map(encodeURIComponent).join("/")}`, {
         method: "PUT",
-        headers: { "Content-Type": "application/json" },
+        headers: { "Content-Type": "application/json", "If-Match": selectedFile.contentHash },
         body: JSON.stringify({ content: fileDraft })
       });
       const payload = await response.json().catch(() => ({}));
@@ -1134,31 +1536,57 @@ export function App() {
         <section className="auth-panel">
           <div>
             <p className="eyebrow">Film Studio</p>
-            <h1>账户登录</h1>
-            <p>模型接口、API key 和历史对话按账户保存。</p>
+            <h1>{authMode === "recover" ? "重设密码" : "账户登录"}</h1>
+            <p>{authMode === "recover" ? "通过预先设置的验证问题重设密码。" : "模型接口、API key 和历史对话按账户保存。"}</p>
           </div>
-          <div className="auth-tabs">
-            <button className={authMode === "login" ? "active" : ""} onClick={() => setAuthMode("login")} type="button">登录</button>
-            <button className={authMode === "register" ? "active" : ""} onClick={() => setAuthMode("register")} type="button">注册</button>
-          </div>
-          <label>
-            <span>邮箱</span>
-            <input value={authEmail} onChange={(event) => setAuthEmail(event.target.value)} type="email" autoComplete="email" />
-          </label>
-          <label>
-            <span>密码</span>
-            <input value={authPassword} onChange={(event) => setAuthPassword(event.target.value)} type="password" autoComplete={authMode === "login" ? "current-password" : "new-password"} />
-          </label>
-          {authMode === "register" && (
-            <label>
-              <span>重复密码</span>
-              <input value={authPasswordRepeat} onChange={(event) => setAuthPasswordRepeat(event.target.value)} type="password" autoComplete="new-password" />
-            </label>
+          {authMode === "recover" ? (
+            <button className="auth-back" type="button" onClick={() => { setAuthMode("login"); setRecoveryChallenge(null); }}>返回登录</button>
+          ) : (
+            <div className="auth-tabs">
+              <button className={authMode === "login" ? "active" : ""} onClick={() => setAuthMode("login")} type="button">登录</button>
+              {registrationEnabled && <button className={authMode === "register" ? "active" : ""} onClick={() => { setAuthMode("register"); void loadRecoveryQuestions(); }} type="button">注册</button>}
+            </div>
           )}
-          <button className="auth-submit" onClick={submitAuth} disabled={!authChecked || task.status === "submitting"} type="button">
-            {task.status === "submitting" ? "处理中..." : authMode === "register" ? "注册并进入" : "登录"}
-          </button>
-          {task.message && <p className={`auth-message ${task.status === "error" ? "error" : ""}`}>{task.message}{task.meta ? ` · ${task.meta}` : ""}</p>}
+          {authMode === "recover" ? (
+            <form className="auth-form" onSubmit={(event) => { event.preventDefault(); void (recoveryChallenge ? resetForgottenPassword() : requestRecoveryChallenge()); }}>
+              <label>
+                <span>账户邮箱</span>
+                <input value={authEmail} onChange={(event) => { setAuthEmail(event.target.value); setRecoveryChallenge(null); }} type="email" autoComplete="email" required maxLength={254} disabled={Boolean(recoveryChallenge)} />
+              </label>
+              {recoveryChallenge ? (
+                <>
+                  <div className="recovery-question"><span>验证问题</span><strong>{recoveryChallenge.question}</strong></div>
+                  <label><span>验证答案</span><input value={recoveryAnswer} onChange={(event) => setRecoveryAnswer(event.target.value)} type="text" autoComplete="off" required minLength={3} maxLength={200} /></label>
+                  <label><span>新密码</span><input value={recoveryNextPassword} onChange={(event) => setRecoveryNextPassword(event.target.value)} type="password" autoComplete="new-password" required minLength={12} maxLength={1024} /></label>
+                  <label><span>重复新密码</span><input value={recoveryNextPasswordRepeat} onChange={(event) => setRecoveryNextPasswordRepeat(event.target.value)} type="password" autoComplete="new-password" required minLength={12} maxLength={1024} /></label>
+                </>
+              ) : null}
+              <button className="auth-submit" disabled={!authChecked || task.status === "submitting"} type="submit">{task.status === "submitting" ? "处理中..." : recoveryChallenge ? "验证并重设密码" : "下一步：验证问题"}</button>
+              {task.message && <p className={`auth-message ${task.status === "error" ? "error" : ""}`}>{task.message}{task.meta ? ` · ${task.meta}` : ""}</p>}
+            </form>
+          ) : (
+            <form className="auth-form" onSubmit={(event) => { event.preventDefault(); void submitAuth(); }}>
+              <label><span>邮箱</span><input value={authEmail} onChange={(event) => setAuthEmail(event.target.value)} type="email" autoComplete="email" required maxLength={254} /></label>
+              <label><span>密码</span><input value={authPassword} onChange={(event) => setAuthPassword(event.target.value)} type="password" autoComplete={authMode === "login" ? "current-password" : "new-password"} required minLength={authMode === "register" ? 12 : 1} maxLength={1024} /></label>
+              {authMode === "register" && (
+                <>
+                  <label><span>重复密码</span><input value={authPasswordRepeat} onChange={(event) => setAuthPasswordRepeat(event.target.value)} type="password" autoComplete="new-password" required minLength={12} maxLength={1024} /></label>
+                  <label>
+                    <span>忘记密码验证问题</span>
+                    <select value={recoveryQuestionId} onChange={(event) => setRecoveryQuestionId(event.target.value)} required>
+                      {recoveryQuestions.map((item) => <option value={item.id} key={item.id}>{item.question}</option>)}
+                    </select>
+                  </label>
+                  <label><span>验证答案</span><input value={recoveryAnswer} onChange={(event) => setRecoveryAnswer(event.target.value)} type="text" autoComplete="off" required minLength={8} maxLength={200} /></label>
+                  <p className="muted">答案仅保存不可逆哈希；忘记密码时必须正确回答。</p>
+                </>
+              )}
+              <button className="auth-submit" disabled={!authChecked || task.status === "submitting"} type="submit">{task.status === "submitting" ? "处理中..." : authMode === "register" ? "注册并进入" : "登录"}</button>
+              {authMode === "login" && <button className="forgot-password-button" type="button" onClick={() => { setAuthMode("recover"); setRecoveryChallenge(null); setTask({ status: "idle", message: "请输入账户邮箱。" }); }}>忘记密码？</button>}
+              {!registrationEnabled && <p className="muted">公开注册已关闭，请使用已有账户登录。</p>}
+              {task.message && <p className={`auth-message ${task.status === "error" ? "error" : ""}`}>{task.message}{task.meta ? ` · ${task.meta}` : ""}</p>}
+            </form>
+          )}
         </section>
       </main>
     );
@@ -1228,6 +1656,7 @@ export function App() {
             </div>
             <div className="account-actions">
               <span>{authUser.email}</span>
+              <button className="ghost-button" onClick={() => void openPasswordPanel()}><KeyRound size={15} />账户安全</button>
               <button className="ghost-button" onClick={() => setView("home")}>返回驾驶舱</button>
               <button className="ghost-button" onClick={logout}>退出</button>
             </div>
@@ -1546,6 +1975,7 @@ export function App() {
                 <p className="eyebrow">Assets</p>
                 <h2>图片 / 视频产物</h2>
               </div>
+              {activeAssetJobId && <button className="ghost-button" onClick={cancelActiveAssetJob}>取消当前任务</button>}
             </div>
             <div className="asset-grid">
               {projectAssets.length ? projectAssets.map((asset) => (
@@ -1595,6 +2025,113 @@ export function App() {
             </div>
           </div>
 
+          {workbench.approval?.entries?.length ? (
+            <div className={`approval-panel ${workbench.approval.status}`}>
+              <div className="section-title compact">
+                <div>
+                  <p className="eyebrow">Human Approval Gate</p>
+                  <h2>{workbench.approval.required ? "Agent 草稿待审批" : `Agent 草稿：${runStatusText(workbench.approval.status)}`}</h2>
+                  <p className="muted">批准前草稿只保存在 run 归档中，不会覆盖正式项目文件。</p>
+                </div>
+                <div className="approval-actions">
+                  <button className="ghost-button" disabled={task.status === "submitting"} onClick={() => void refreshRunApproval()}>
+                    <RefreshCw size={14} />刷新
+                  </button>
+                  {workbench.approval.rollback?.available ? (
+                    <button className="ghost-button reject" disabled={task.status === "submitting"} onClick={rollbackLatestApproval}>回滚最近发布</button>
+                  ) : null}
+                  {workbench.approval.required ? (
+                    <>
+                      <label className="approval-select-all">
+                        <input
+                          type="checkbox"
+                          checked={
+                            workbench.approval.entries.filter((entry) => entry.status === "pending").length > 0
+                            && selectedApprovalEntryIds.length === workbench.approval.entries.filter((entry) => entry.status === "pending").length
+                          }
+                          onChange={(event) => setSelectedApprovalEntryIds(event.target.checked
+                            ? workbench.approval!.entries.filter((entry) => entry.status === "pending").map((entry) => entry.id)
+                            : [])}
+                        />
+                        全选待审
+                      </label>
+                      <button className="ghost-button reject" disabled={task.status === "submitting" || !selectedApprovalEntryIds.length} onClick={() => decideRunApproval("reject")}>拒绝所选</button>
+                      <button
+                        className="primary-action"
+                        disabled={
+                          task.status === "submitting"
+                          || !selectedApprovalEntryIds.length
+                          || workbench.approval.entries.some((entry) => selectedApprovalEntryIds.includes(entry.id) && entry.conflicted)
+                        }
+                        onClick={() => decideRunApproval("approve")}
+                      >
+                        批准所选 ({selectedApprovalEntryIds.length})
+                      </button>
+                    </>
+                  ) : null}
+                </div>
+              </div>
+              <div className="approval-drafts">
+                {workbench.approval.entries.map((entry) => (
+                  <details className={`approval-draft ${entry.conflicted ? "conflicted" : ""}`} key={entry.id} open={workbench.approval?.required}>
+                    <summary>
+                      <input
+                        type="checkbox"
+                        aria-label={`选择 ${entry.targetPath}`}
+                        checked={selectedApprovalEntryIds.includes(entry.id)}
+                        disabled={entry.status !== "pending"}
+                        onClick={(event) => event.stopPropagation()}
+                        onChange={(event) => setSelectedApprovalEntryIds((current) => event.target.checked
+                          ? [...new Set([...current, entry.id])]
+                          : current.filter((id) => id !== entry.id))}
+                      />
+                      <strong>{entry.agentName || agentName(entry.agentId)}</strong>
+                      <code>{entry.targetPath}</code>
+                      <span>{entry.mode === "append" ? "追加" : "替换"} · {runStatusText(entry.status)}{entry.conflicted ? " · 正式文件已变化" : ""}</span>
+                    </summary>
+                    {entry.conflicted ? (
+                      <p className="approval-conflict-note">该正式文件在草稿生成后发生变化。系统已禁止批准，请刷新并通过继续 Run 重新生成草稿。</p>
+                    ) : null}
+                    {entry.diff ? (
+                      <div className="approval-diff-summary">
+                        <span>+{entry.diff.added}</span>
+                        <span>-{entry.diff.removed}</span>
+                        <em>{entry.diff.beforeLineCount} → {entry.diff.afterLineCount} 行{entry.diff.truncated ? " · 大文件仅展示前段差异" : ""}</em>
+                      </div>
+                    ) : null}
+                    <div className="approval-diff">
+                      <section>
+                        <h3>当前正式版本</h3>
+                        <pre>{entry.currentContent || "（当前文件不存在或这是目录接力记录）"}</pre>
+                      </section>
+                      <section>
+                        <h3>Agent 草稿</h3>
+                        <pre>{entry.draftContent || "（草稿内容为空）"}</pre>
+                      </section>
+                    </div>
+                    {entry.diff?.lines?.length ? (
+                      <div className="approval-unified-diff" aria-label={`${entry.targetPath} 结构化行差异`}>
+                        {entry.diff.lines.map((line, index) => (
+                          <div className={line.type} key={`${line.type}-${line.oldLine}-${line.newLine}-${index}`}>
+                            <span>{line.oldLine ?? ""}</span>
+                            <span>{line.newLine ?? ""}</span>
+                            <code>{line.type === "add" ? "+" : line.type === "remove" ? "-" : " "}{line.text}</code>
+                          </div>
+                        ))}
+                      </div>
+                    ) : null}
+                    {entry.status === "pending" ? (
+                      <div className="approval-entry-actions">
+                        <button className="ghost-button reject" disabled={task.status === "submitting"} onClick={() => decideRunApproval("reject", [entry.id])}>拒绝此文件</button>
+                        <button className="primary-action" disabled={task.status === "submitting" || entry.conflicted} onClick={() => decideRunApproval("approve", [entry.id])}>批准此文件</button>
+                      </div>
+                    ) : null}
+                  </details>
+                ))}
+              </div>
+            </div>
+          ) : null}
+
           <div className="run-files">
             <div className="section-title compact">
               <div>
@@ -1613,6 +2150,7 @@ export function App() {
             )}
           </div>
         </section>
+        {renderPasswordPanel()}
       </main>
     );
   }
@@ -1639,6 +2177,7 @@ export function App() {
           </div>
           <div className="topbar-actions">
             <span className="account-label">{authUser.email}</span>
+            <button className="icon-button" aria-label="账户安全" title="账户安全" onClick={() => void openPasswordPanel()}><KeyRound size={18} /></button>
             <button className="icon-button" aria-label="Search" title="Search"><Search size={18} /></button>
             <button className="icon-button" aria-label="Settings" title="Settings" onClick={() => { setView("workspace"); openModelSettings(); }}><SlidersHorizontal size={18} /></button>
             <button className="primary-action" onClick={openNewProject}><Plus size={18} />新项目</button>
@@ -1714,12 +2253,12 @@ export function App() {
           </div>
 
           <div className="preview-stage" id="canvas">
-            <img src="/assets/slide-scene.png" alt="滑梯场景关键视觉" />
+            <img src={projectPreviewAsset?.url || "/assets/dino.png"} alt={currentProject ? `${currentProject.title} 项目视觉` : "项目关键视觉"} decoding="async" />
             <div className="preview-overlay">
               <span>Canvas Preview</span>
-              <strong>P001 滑梯旁的小恐龙</strong>
+              <strong>{currentProject?.title || "尚未选择项目"}</strong>
             </div>
-            <button className="play-button" aria-label="Play preview"><Play size={24} fill="currentColor" /></button>
+            <button className="play-button" aria-label="打开项目资产" title="打开项目资产" onClick={() => setView("workspace")}><Play size={24} fill="currentColor" /></button>
           </div>
         </section>
 
@@ -1740,7 +2279,7 @@ export function App() {
                 <p className="eyebrow">Film Agents</p>
                 <h2>岗位工位</h2>
               </div>
-              <button className="ghost-button"><Command size={16} />路由配置</button>
+              <button className="ghost-button" onClick={() => { setView("workspace"); openModelSettings(); }}><Command size={16} />路由配置</button>
             </div>
             <div className="agent-grid">
               {agentCards.map((agent) => {
@@ -1779,7 +2318,7 @@ export function App() {
             <div className="asset-stack">
               {assets.map((asset) => (
                 <figure key={asset.src}>
-                  <img src={asset.src} alt={asset.title} />
+                  <img src={asset.src} alt={asset.title} loading="lazy" decoding="async" />
                   <figcaption><span>{asset.tag}</span>{asset.title}</figcaption>
                 </figure>
               ))}
@@ -1793,7 +2332,7 @@ export function App() {
               <p className="eyebrow">Production Workflow</p>
               <h2>10 阶段生产流水线</h2>
             </div>
-            <button className="ghost-button"><FileCheck2 size={16} />双通道同步</button>
+            <button className="ghost-button" onClick={() => setPrompt("检查当前项目所有正式文件与对话归档是否完成双通道同步，并列出缺失项。") }><FileCheck2 size={16} />双通道同步</button>
           </div>
           <div className="timeline">
             {stages.map((stage) => (
@@ -1833,6 +2372,7 @@ export function App() {
           </div>
         </section>
       </section>
+      {renderPasswordPanel()}
     </main>
   );
 }
@@ -2124,6 +2664,7 @@ function createCompletedWorkbench(prompt: string, payload: any, previousMessages
     events,
     historyEvents,
     agentWork: Array.isArray(payload?.agentWork) ? payload.agentWork : [],
+    approval: payload?.approval,
     responseText: degraded ? undefined : payload?.text,
     messages
   };
@@ -2149,6 +2690,7 @@ function createWorkbenchFromRun(run: any): WorkbenchState {
     events,
     historyEvents,
     agentWork: Array.isArray(run?.agentWork) ? run.agentWork : [],
+    approval: run?.approval,
     responseText: threadMessages.length ? undefined : run?.resultText,
     messages: threadMessages.length ? threadMessages : [
       { speaker: "user", title: "用户 / 历史需求", body: run?.prompt || "历史 run 未记录 prompt。" },
@@ -2396,7 +2938,9 @@ function eventStatusText(status: WorkEvent["status"]) {
     running: "运行中",
     done: "已完成",
     degraded: "失败",
-    error: "失败"
+    error: "失败",
+    awaiting_approval: "待审批",
+    rejected: "已拒绝"
   }[status] || status;
 }
 
@@ -2406,7 +2950,13 @@ function runStatusText(status: string) {
     running: "运行中",
     pending: "待执行",
     degraded: "失败",
-    error: "失败"
+    error: "失败",
+    awaiting_approval: "待审批",
+    approved: "已批准",
+    rejected: "已拒绝",
+    mixed: "部分批准",
+    rolled_back: "已回滚",
+    pending_approval: "待审批"
   }[status] || status;
 }
 
@@ -2606,15 +3156,35 @@ async function waitForFilmTaskJob(jobId: string, projectId: string, prompt: stri
   throw new Error(`后台任务 ${jobId} 等待超时。`);
 }
 
+async function waitForAssetTaskJob(jobId: string, onProgress?: (job: any) => void) {
+  for (let attempt = 0; attempt < 240; attempt += 1) {
+    if (attempt > 0) await delay(2500);
+    const response = await apiFetch(`/api/film/asset-jobs/${encodeURIComponent(jobId)}`);
+    const payload = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(payload?.detail || payload?.error || `Asset job ${jobId} is not available.`);
+    onProgress?.(payload);
+    if (payload?.status === "done" && payload?.result) return { ok: true, asset: payload.result };
+    if (payload?.status === "cancelled") throw new Error("资产任务已取消。");
+    if (payload?.status === "error") {
+      throw new Error(payload?.error?.message || "资产后台任务失败。");
+    }
+  }
+  throw new Error(`资产后台任务 ${jobId} 等待超时。`);
+}
+
 function apiUrl(path: string) {
   return `${apiBaseUrl}${path}`;
 }
 
-function apiFetch(path: string, init: RequestInit = {}) {
-  return fetch(apiUrl(path), {
+async function apiFetch(path: string, init: RequestInit = {}) {
+  const response = await fetch(apiUrl(path), {
     ...init,
     credentials: "include"
   });
+  if (response.status === 401 && !path.startsWith("/api/auth/")) {
+    window.dispatchEvent(new Event("film-auth-expired"));
+  }
+  return response;
 }
 
 function describeFetchFailure(error: unknown) {
@@ -2636,4 +3206,3 @@ function findFallbackAgent(id: string): (typeof agents)[number] | undefined {
   const normalized = aliases[id] || id;
   return agents.find((agent) => agent.id === normalized || agent.workspace.includes(id) || agent.workspace.includes(normalized));
 }
-
