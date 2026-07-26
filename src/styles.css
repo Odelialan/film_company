@@ -139,6 +139,16 @@ button { border: 0; color: inherit; cursor: pointer; }
   padding: 20px;
   background: rgba(4, 5, 8, 0.78);
   backdrop-filter: blur(10px);
+  width: 100%;
+  max-width: none;
+  height: 100%;
+  border: 0;
+  color: inherit;
+}
+
+.password-overlay::backdrop {
+  background: rgba(4, 5, 8, 0.78);
+  backdrop-filter: blur(10px);
 }
 
 .password-panel {
@@ -188,6 +198,28 @@ button { border: 0; color: inherit; cursor: pointer; }
 
 .security-section h3 {
   margin: 0;
+}
+
+.usage-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.usage-grid span {
+  display: grid;
+  gap: 3px;
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  color: var(--muted);
+  background: rgba(255, 255, 255, 0.035);
+  font-size: 12px;
+}
+
+.usage-grid strong {
+  color: var(--text);
+  font-size: 13px;
 }
 
 .app-shell {
@@ -705,6 +737,16 @@ p { color: var(--muted); line-height: 1.65; }
 .composer button:disabled {
   opacity: 0.72;
   cursor: wait;
+}
+
+:where(button, a, input, select, textarea, summary):focus-visible {
+  outline: 3px solid var(--cyan);
+  outline-offset: 3px;
+}
+
+.turnstile-slot {
+  min-height: 65px;
+  overflow: hidden;
 }
 
 .task-result {
@@ -1933,6 +1975,25 @@ p { color: var(--muted); line-height: 1.65; }
 }
 
 @media (max-width: 720px) {
+  .usage-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .auth-shell {
+    padding: 14px;
+  }
+
+  .auth-panel,
+  .password-panel {
+    width: 100%;
+    padding: 18px;
+    border-radius: 16px;
+  }
+
+  .password-overlay {
+    padding: 10px;
+  }
+
   .approval-draft summary,
   .approval-diff {
     grid-template-columns: 1fr;
@@ -1949,5 +2010,16 @@ p { color: var(--muted); line-height: 1.65; }
   .approval-actions {
     width: 100%;
     flex-wrap: wrap;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    scroll-behavior: auto !important;
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
   }
 }

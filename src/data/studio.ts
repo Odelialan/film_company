@@ -148,7 +148,7 @@ export const nav = [
 ];
 
 export const assets = [
-  { src: "/assets/dino.png", title: "角色资产", tag: "小恐龙" }
+  { src: "/assets/dino.webp", title: "角色资产", tag: "小恐龙" }
 ];
 
 export const loopSteps = ["接收消息", "上下文组装", "模型推理", "工具执行", "流式回复", "持久化归档"];

@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { spawn } from "node:child_process";
 import { once } from "node:events";
-import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { access, chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import net from "node:net";
 import os from "node:os";
 import path from "node:path";
@@ -252,10 +252,27 @@ test("project edits and approvals reject stale data, roll back partial publicati
     });
     assert.equal(login.status, 200, await login.text());
     const cookie = (login.headers.get("set-cookie") || "").split(";", 1)[0];
+    const renamed = await fetch(`${baseUrl}/api/film/projects/${encodeURIComponent(projectId)}`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json", Cookie: cookie },
+      body: JSON.stringify({ name: "稳定身份测试项目" })
+    });
+    const renamedPayload = await renamed.json();
+    assert.equal(renamed.status, 200);
+    assert.equal(renamedPayload.projectId, projectId);
+    assert.equal(renamedPayload.project.title, "稳定身份测试项目");
+    await access(projectPath);
     const fileUrl = `${baseUrl}/api/film/projects/${encodeURIComponent(projectId)}/files/03_script/SCRIPT_V1.md`;
     const opened = await fetch(fileUrl, { headers: { Cookie: cookie } });
     const openedPayload = await opened.json();
     assert.equal(opened.status, 200);
+    const reservedRead = await fetch(
+      `${baseUrl}/api/film/projects/${encodeURIComponent(projectId)}/files/_runs/${encodeURIComponent(crashCommitRunId)}/STATUS.json`,
+      { headers: { Cookie: cookie } }
+    );
+    assert.equal(reservedRead.status, 400, await reservedRead.clone().text());
+    const reservedPayload = await reservedRead.json();
+    assert.equal("detail" in reservedPayload, false);
     const staleEdit = await fetch(fileUrl, {
       method: "PUT",
       headers: { "Content-Type": "application/json", Cookie: cookie, "If-Match": "stale" },
@@ -428,7 +445,7 @@ test("project edits and approvals reject stale data, roll back partial publicati
     const corruptOwner = await fetch(`${baseUrl}/api/film/projects/${encodeURIComponent(projectId)}/documents`, {
       headers: { Cookie: cookie }
     });
-    assert.equal(corruptOwner.status, 503, await corruptOwner.text());
+    assert.equal(corruptOwner.status, 200, await corruptOwner.text());
   } finally {
     await chmod(path.join(projectPath, "00_admin"), 0o755).catch(() => {});
     child.kill("SIGTERM");

@@ -3,13 +3,10 @@ import test from "node:test";
 
 import {
   AuthStoreError,
-  deriveRecoveryAnswerRecord,
   derivePasswordRecord,
-  normalizeRecoveryAnswer,
   normalizeUsersRecord,
   parseUsersRecord,
-  verifyPasswordRecord,
-  verifyRecoveryAnswerRecord
+  verifyPasswordRecord
 } from "./auth-policy.js";
 
 test("legacy scrypt password records remain verifiable after async migration", async () => {
@@ -39,18 +36,4 @@ test("authentication store drops invalid sessions without locking out valid user
   });
   assert.equal(record.users[0].email, "a@example.com");
   assert.equal(record.sessions.length, 1);
-});
-
-test("recovery answers are normalized and stored as one-way scrypt records", async () => {
-  assert.equal(normalizeRecoveryAnswer("  蓝色　海豚  "), "蓝色 海豚");
-  assert.equal(normalizeRecoveryAnswer("My Secret"), "my secret");
-  const record = await deriveRecoveryAnswerRecord("My Secret", "ffeeddccbbaa99887766554433221100");
-  assert.equal(await verifyRecoveryAnswerRecord("  my   secret ", {
-    answerSalt: record.salt,
-    answerHash: record.hash
-  }), true);
-  assert.equal(await verifyRecoveryAnswerRecord("another answer", {
-    answerSalt: record.salt,
-    answerHash: record.hash
-  }), false);
 });

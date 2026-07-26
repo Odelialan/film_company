@@ -19,6 +19,10 @@ export function normalizeTrustedModelBaseUrl(value) {
   if (!["https:", "http:"].includes(url.protocol) || url.username || url.password || url.search || url.hash) {
     throw policyError("Model base URL contains a forbidden protocol, credential, query, or fragment.");
   }
+  const loopbackHosts = new Set(["localhost", "127.0.0.1", "[::1]"]);
+  if (url.protocol !== "https:" && !loopbackHosts.has(url.hostname.toLowerCase())) {
+    throw policyError("Model base URL must use HTTPS unless it targets an explicit loopback address.");
+  }
   return url.href.replace(/\/$/, "");
 }
 

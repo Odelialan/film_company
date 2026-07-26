@@ -1,10 +1,11 @@
 import cors from "cors";
 import dotenv from "dotenv";
 import express from "express";
+import nodemailer from "nodemailer";
 import fs from "node:fs";
 import fsp from "node:fs/promises";
 import { spawn } from "node:child_process";
-import { createHash, randomBytes } from "node:crypto";
+import { createHash, randomBytes, randomUUID } from "node:crypto";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -22,18 +23,18 @@ import { buildStructuredLineDiff } from "./diff-policy.js";
 import { agentInputDocuments, allocateDocumentContext, fingerprintContextDocuments, formatAgentContextSections } from "./context-policy.js";
 import {
   AuthStoreError,
-  deriveRecoveryAnswerRecord,
   derivePasswordRecord,
-  normalizeRecoveryAnswer,
   normalizeUsersRecord,
-  parseUsersRecord,
-  verifyPasswordRecord,
-  verifyRecoveryAnswerRecord
+  verifyPasswordRecord
 } from "./auth-policy.js";
+import { FilmDatabase } from "./database.js";
+import { generateRegistrationCode, validateTurnstileResult } from "./registration-policy.js";
+import { normalizeApiErrorPayload, sanitizePublicPayload } from "./api-policy.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
+process.umask(0o077);
 dotenv.config({ path: path.join(__dirname, ".env") });
 dotenv.config();
 
@@ -62,7 +63,9 @@ const legacyRunsRoot = path.join(filmWorkspacePath, "runs");
 const projectTemplateRoot = path.join(legacyProjectsRoot, "_PROJECT_TEMPLATE");
 const projectsRoot = process.env.FILM_PROJECTS_ROOT
   ? path.resolve(process.env.FILM_PROJECTS_ROOT)
-  : path.join(repoRoot, "projects");
+  : process.env.FILM_TEST_MODE === "1" && process.env.FILM_AUTH_STORE_PATH
+    ? path.join(path.dirname(path.resolve(process.env.FILM_AUTH_STORE_PATH)), "projects")
+    : path.join(repoRoot, "projects");
 const migrationMapPath = path.join(projectsRoot, "_migration_map.json");
 const modelConfigPath = path.join(__dirname, "model-config.json");
 const usersPath = process.env.FILM_AUTH_STORE_PATH
@@ -71,9 +74,9 @@ const usersPath = process.env.FILM_AUTH_STORE_PATH
 const userDataRoot = process.env.FILM_USER_DATA_ROOT
   ? path.resolve(process.env.FILM_USER_DATA_ROOT)
   : path.join(__dirname, "user-data");
-const authBackupPath = process.env.FILM_AUTH_BACKUP_PATH
-  ? path.resolve(process.env.FILM_AUTH_BACKUP_PATH)
-  : path.join(userDataRoot, "_auth", "users.backup.json");
+const databasePath = process.env.FILM_DATABASE_PATH
+  ? path.resolve(process.env.FILM_DATABASE_PATH)
+  : path.join(userDataRoot, "film-studio.sqlite");
 const authCookieName = "film_studio_session";
 const defaultOwnerEmail = String(process.env.FILM_DEFAULT_OWNER_EMAIL || "").trim().toLowerCase();
 const dreaminaBin = process.env.DREAMINA_BIN || "/home/honeycake/.local/bin/dreamina";
@@ -97,8 +100,37 @@ const maxDreaminaOutputBytes = positiveNumberEnv("FILM_MAX_DREAMINA_OUTPUT_BYTES
 const dreaminaSubmitTimeoutMs = positiveNumberEnv("FILM_DREAMINA_SUBMIT_TIMEOUT_MS", 120_000);
 const dreaminaQueryTimeoutMs = positiveNumberEnv("FILM_DREAMINA_QUERY_TIMEOUT_MS", 90_000);
 const minimumPasswordLength = positiveNumberEnv("FILM_MIN_PASSWORD_LENGTH", 12);
-const minimumRecoveryAnswerLength = positiveNumberEnv("FILM_MIN_RECOVERY_ANSWER_LENGTH", 8);
 const testMode = process.env.FILM_TEST_MODE === "1";
+const turnstileSiteKey = String(process.env.FILM_TURNSTILE_SITE_KEY || "").trim();
+const turnstileSecretKey = String(process.env.FILM_TURNSTILE_SECRET_KEY || "").trim();
+const turnstileHostname = String(process.env.FILM_TURNSTILE_HOSTNAME || new URL(frontendOrigin).hostname).trim().toLowerCase();
+const turnstileAction = String(process.env.FILM_TURNSTILE_ACTION || "register").trim();
+const publicProjectLimit = positiveNumberEnv("FILM_PUBLIC_PROJECT_LIMIT", 10);
+const publicStorageLimitBytes = positiveNumberEnv("FILM_PUBLIC_STORAGE_LIMIT_BYTES", 250 * 1024 * 1024);
+const publicDailyFilmRunLimit = positiveNumberEnv("FILM_PUBLIC_DAILY_FILM_RUN_LIMIT", 30);
+const publicModelProfileLimit = positiveNumberEnv("FILM_PUBLIC_MODEL_PROFILE_LIMIT", 10);
+const promptMaxBytes = positiveNumberEnv("FILM_PROMPT_MAX_BYTES", 32 * 1024);
+const adminDailyAssetLimit = positiveNumberEnv("FILM_ADMIN_DAILY_ASSET_LIMIT", 20);
+const assetImageLimitBytes = positiveNumberEnv("FILM_ASSET_IMAGE_LIMIT_BYTES", 50 * 1024 * 1024);
+const assetVideoLimitBytes = positiveNumberEnv("FILM_ASSET_VIDEO_LIMIT_BYTES", 500 * 1024 * 1024);
+const assetJobLimitBytes = positiveNumberEnv("FILM_ASSET_JOB_LIMIT_BYTES", 1024 * 1024 * 1024);
+const assetProjectLimitBytes = positiveNumberEnv("FILM_ASSET_PROJECT_LIMIT_BYTES", 5 * 1024 * 1024 * 1024);
+const assetAccountLimitBytes = positiveNumberEnv("FILM_ASSET_ACCOUNT_LIMIT_BYTES", 20 * 1024 * 1024 * 1024);
+const minimumFreeDiskBytes = positiveNumberEnv("FILM_MINIMUM_FREE_DISK_BYTES", 2 * 1024 * 1024 * 1024);
+const filmRunStorageReservationBytes = positiveNumberEnv("FILM_RUN_STORAGE_RESERVATION_BYTES", 5 * 1024 * 1024);
+const projectCreationStorageReservationBytes = positiveNumberEnv(
+  "FILM_PROJECT_CREATION_STORAGE_RESERVATION_BYTES",
+  256 * 1024
+);
+
+const filmDb = new FilmDatabase({
+  databasePath,
+  userDataRoot,
+  projectsRoot,
+  usersPath,
+  modelConfigPath,
+  defaultOwnerEmail
+});
 
 const allowedOrigins = new Set([
   frontendOrigin,
@@ -124,7 +156,7 @@ app.use((req, res, next) => {
   res.setHeader("Cross-Origin-Resource-Policy", "same-origin");
   res.setHeader(
     "Content-Security-Policy",
-    "default-src 'self'; base-uri 'none'; object-src 'none'; frame-ancestors 'none'; form-action 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; media-src 'self' blob:; font-src 'self' data:; connect-src 'self'"
+    "default-src 'self'; base-uri 'none'; object-src 'none'; frame-ancestors 'none'; form-action 'self'; script-src 'self' https://challenges.cloudflare.com; frame-src https://challenges.cloudflare.com; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; media-src 'self' blob:; font-src 'self' data:; connect-src 'self' https://challenges.cloudflare.com"
   );
   if (process.env.NODE_ENV === "production") {
     res.setHeader("Strict-Transport-Security", "max-age=31536000; includeSubDomains");
@@ -141,41 +173,28 @@ app.use((req, res, next) => {
   next();
 });
 app.use(express.json({ limit: "1mb" }));
-
-const rateLimitBuckets = new Map();
-const maxRateLimitBuckets = positiveNumberEnv("FILM_MAX_RATE_LIMIT_BUCKETS", 10_000);
-let lastRateLimitSweepAt = 0;
-
-function sweepExpiredRateLimitBuckets(now) {
-  if (now - lastRateLimitSweepAt < 60_000 && rateLimitBuckets.size < maxRateLimitBuckets) return;
-  lastRateLimitSweepAt = now;
-  for (const [bucketKey, bucket] of rateLimitBuckets.entries()) {
-    if (bucket.resetAt <= now) rateLimitBuckets.delete(bucketKey);
-  }
-}
+app.use((_req, res, next) => {
+  const sendJson = res.json.bind(res);
+  res.json = (payload) => {
+    if (res.statusCode >= 400 && payload && typeof payload === "object") {
+      return sendJson(normalizeApiErrorPayload(res.statusCode, payload, res.getHeader("Retry-After")));
+    }
+    return sendJson(sanitizePublicPayload(payload));
+  };
+  next();
+});
 
 function createRateLimiter({ windowMs, max, key = (req) => req.ip || "unknown" }) {
   return (req, res, next) => {
     const now = Date.now();
-    sweepExpiredRateLimitBuckets(now);
     const bucketKey = String(key(req) || "unknown");
-    const current = rateLimitBuckets.get(bucketKey);
-    if (!current && rateLimitBuckets.size >= maxRateLimitBuckets) {
-      res.setHeader("Retry-After", "60");
-      res.status(429).json({ ok: false, error: "Rate limit capacity has been reached. Try again later." });
-      return;
-    }
-    const bucket = !current || current.resetAt <= now
-      ? { count: 0, resetAt: now + windowMs }
-      : current;
-    bucket.count += 1;
-    rateLimitBuckets.set(bucketKey, bucket);
+    const bucket = filmDb.consumeRateLimit(bucketKey, windowMs, max, now);
     res.setHeader("RateLimit-Limit", String(max));
     res.setHeader("RateLimit-Remaining", String(Math.max(0, max - bucket.count)));
     res.setHeader("RateLimit-Reset", String(Math.ceil(bucket.resetAt / 1000)));
-    if (bucket.count > max) {
+    if (!bucket.allowed) {
       res.setHeader("Retry-After", String(Math.max(1, Math.ceil((bucket.resetAt - now) / 1000))));
-      res.status(429).json({ ok: false, error: "Too many requests. Try again later." });
+      res.status(429).json({ ok: false, code: "RATE_LIMITED", error: "Too many requests. Try again later.", retryAfter: Math.max(1, Math.ceil((bucket.resetAt - now) / 1000)) });
       return;
     }
     next();
@@ -201,16 +220,6 @@ const passwordMutationRateLimit = createRateLimiter({
   windowMs: 60 * 60_000,
   max: 5,
   key: (req) => `password:${req.user?.id || req.ip || "unknown"}`
-});
-const recoveryIpRateLimit = createRateLimiter({
-  windowMs: 60 * 60_000,
-  max: 20,
-  key: (req) => `recovery-ip:${req.ip || "unknown"}`
-});
-const recoveryAccountRateLimit = createRateLimiter({
-  windowMs: 60 * 60_000,
-  max: 6,
-  key: (req) => `recovery-account:${createHash("sha256").update(normalizeEmail(req.body?.email)).digest("hex").slice(0, 20)}`
 });
 const taskRateLimit = createRateLimiter({
   windowMs: 60 * 60_000,
@@ -465,54 +474,12 @@ function envModelProfile() {
   };
 }
 
-function trustedModelBaseUrls() {
-  const candidates = [
-    process.env.MODEL_BASE_URL || "https://api.aicodewith.com/chatgpt/v1",
-    ...String(process.env.FILM_ALLOWED_MODEL_BASE_URLS || "").split(",").map((item) => item.trim())
-  ];
-  try {
-    const record = JSON.parse(fs.readFileSync(modelConfigPath, "utf8"));
-    for (const profile of Array.isArray(record?.profiles) ? record.profiles : []) {
-      if (profile?.baseUrl) candidates.push(profile.baseUrl);
-    }
-  } catch {
-    // Environment configuration remains the trust source when no admin config exists.
-  }
-  const trusted = new Set();
-  for (const candidate of candidates.filter(Boolean)) {
-    try {
-      trusted.add(normalizeTrustedModelBaseUrl(candidate));
-    } catch {
-      // Ignore malformed administrator entries instead of expanding the trust boundary.
-    }
-  }
-  return trusted;
-}
-
 function assertTrustedModelBaseUrl(value) {
-  const normalized = normalizeTrustedModelBaseUrl(value);
-  if (!trustedModelBaseUrls().has(normalized)) {
-    const error = new Error("Model base URL is not in the server administrator allowlist.");
-    error.status = 400;
-    throw error;
-  }
-  return normalized;
+  return normalizeTrustedModelBaseUrl(value);
 }
 
 function normalizeEmail(email) {
   return String(email || "").trim().toLowerCase();
-}
-
-const recoveryQuestions = Object.freeze([
-  { id: "account_name", question: "我的名字叫什么？" },
-  { id: "recovery_phrase", question: "你为这个账户设置的恢复暗语是什么？" },
-  { id: "childhood_story", question: "你童年最喜欢的故事、书或动画是什么？" },
-  { id: "first_creation", question: "你完成的第一件创作作品叫什么？" },
-  { id: "memorable_place", question: "一个对你有特殊意义的地点叫什么？" }
-]);
-
-function findRecoveryQuestion(questionId) {
-  return recoveryQuestions.find((item) => item.id === String(questionId || "")) || null;
 }
 
 function userIdFromEmail(email) {
@@ -521,9 +488,8 @@ function userIdFromEmail(email) {
 
 function readUsersSync() {
   try {
-    return parseUsersRecord(fs.readFileSync(usersPath, "utf8"));
+    return filmDb.readAuthRecord();
   } catch (error) {
-    if (error?.code === "ENOENT") return { users: [], sessions: [] };
     if (error instanceof AuthStoreError) throw error;
     throw new AuthStoreError(`Unable to read authentication store: ${error instanceof Error ? error.message : String(error)}`);
   }
@@ -531,13 +497,7 @@ function readUsersSync() {
 
 async function writeUsers(record) {
   const normalized = normalizeUsersRecord(record);
-  if (fs.existsSync(usersPath)) {
-    await fsp.mkdir(path.dirname(authBackupPath), { recursive: true, mode: 0o700 });
-    await fsp.chmod(path.dirname(authBackupPath), 0o700);
-    await fsp.copyFile(usersPath, authBackupPath);
-    await fsp.chmod(authBackupPath, 0o600);
-  }
-  await writeJson(usersPath, normalized);
+  filmDb.replaceAuthRecord(normalized);
 }
 
 let usersMutationTail = Promise.resolve();
@@ -567,8 +527,106 @@ function publicUser(user) {
     id: user.id,
     email: user.email,
     createdAt: user.createdAt || null,
-    recoveryConfigured: Boolean(user.recovery?.questionId && user.recovery?.answerHash && user.recovery?.answerSalt)
+    role: user.role || "user",
+    status: user.status || (user.disabled ? "disabled" : "active"),
+    emailVerified: Boolean(user.emailVerified)
   } : null;
+}
+
+function accountStorageLimitFor(user) {
+  return user?.role === "admin" ? assetAccountLimitBytes : publicStorageLimitBytes;
+}
+
+function registrationServiceReady() {
+  const smtpReady = process.env.FILM_SMTP_JSON_TRANSPORT === "1"
+    ? testMode
+    : Boolean(process.env.FILM_SMTP_HOST && process.env.FILM_SMTP_FROM);
+  return registrationEnabled && Boolean(turnstileSiteKey && turnstileSecretKey && smtpReady);
+}
+
+function registrationMailer() {
+  if (testMode && process.env.FILM_SMTP_JSON_TRANSPORT === "1") {
+    return nodemailer.createTransport({ jsonTransport: true });
+  }
+  return nodemailer.createTransport({
+    host: String(process.env.FILM_SMTP_HOST || ""),
+    port: positiveNumberEnv("FILM_SMTP_PORT", 587),
+    secure: process.env.FILM_SMTP_SECURE === "1",
+    auth: process.env.FILM_SMTP_USER
+      ? {
+          user: process.env.FILM_SMTP_USER,
+          pass: process.env.FILM_SMTP_PASSWORD || ""
+        }
+      : undefined
+  });
+}
+
+async function verifyTurnstile(req, token) {
+  const value = String(token || "").trim();
+  if (!value || value.length > 2048 || !turnstileSecretKey) return false;
+  const tokenHash = createHash("sha256").update(value).digest("hex");
+  if (!filmDb.markTurnstileTokenUsed(tokenHash)) return false;
+  let result;
+  if (testMode && value === "test-valid-turnstile") {
+    result = {
+      success: true,
+      hostname: turnstileHostname,
+      action: turnstileAction,
+      challenge_ts: new Date().toISOString()
+    };
+  } else {
+    const idempotencyKey = randomUUID();
+    const body = new URLSearchParams({
+      secret: turnstileSecretKey,
+      response: value,
+      remoteip: String(req.ip || ""),
+      idempotency_key: idempotencyKey
+    });
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      try {
+        const response = await fetch("https://challenges.cloudflare.com/turnstile/v0/siteverify", {
+          method: "POST",
+          headers: { "content-type": "application/x-www-form-urlencoded" },
+          body,
+          signal: AbortSignal.timeout(10_000)
+        });
+        if (response.ok) {
+          result = await response.json();
+          break;
+        }
+      } catch {
+        // Retry once with the same Siteverify idempotency key, then fail closed.
+      }
+      if (attempt === 0) await new Promise((resolve) => setTimeout(resolve, 150));
+    }
+    if (!result) return false;
+  }
+  return validateTurnstileResult(result, {
+    hostname: turnstileHostname,
+    action: turnstileAction
+  });
+}
+
+async function sendRegistrationCode(email, code) {
+  const transporter = registrationMailer();
+  await transporter.sendMail({
+    from: process.env.FILM_SMTP_FROM,
+    to: email,
+    subject: "Film Studio 注册验证码",
+    text: `你的 Film Studio 注册验证码是 ${code}。验证码将在 10 分钟后失效，请勿转发。`
+  });
+}
+
+function requireAdmin(req, res, next) {
+  if (req.user?.role !== "admin") {
+    res.status(403).json({
+      ok: false,
+      code: "ASSET_ADMIN_REQUIRED",
+      error: "Administrator access is required for platform asset generation."
+    });
+    return;
+  }
+  next();
 }
 
 function parseCookies(req) {
@@ -588,7 +646,7 @@ function sessionHash(token) {
 }
 
 function cookieOptions(req, maxAgeSeconds = 30 * 24 * 60 * 60) {
-  const secure = req.secure || process.env.COOKIE_SECURE === "true";
+  const secure = process.env.FILM_COOKIE_SECURE === "1" || req.secure || process.env.COOKIE_SECURE === "true";
   const origin = String(req.headers.origin || "");
   const requestOrigin = `${secure ? "https" : "http"}://${req.headers.host || ""}`;
   const crossOriginCredentials = origin && allowedOrigins.has(origin) && origin !== requestOrigin && secure;
@@ -647,7 +705,7 @@ async function authenticateRequest(req) {
   const session = record.sessions.find((item) => item.tokenHash === tokenHash && new Date(item.expiresAt || 0).getTime() > now);
   if (!session) return null;
   const user = record.users.find((item) => item.id === session.userId);
-  return user && !user.disabled ? user : null;
+  return user && user.status === "active" && user.emailVerified ? user : null;
 }
 
 function sendAuthServiceError(res, error) {
@@ -707,8 +765,8 @@ function normalizeModelProfile(profile = {}, existingProfile = null, credentialP
 
 function readModelSettingsSync(user = null) {
   const envProfile = envModelProfile();
-  const configPath = user ? userModelConfigPath(user) : modelConfigPath;
-  if (!fs.existsSync(configPath)) {
+  const stored = user ? filmDb.readModelSettings(user.id) : null;
+  if (!stored) {
     if (user) {
       const userProfile = {
         ...envProfile,
@@ -721,7 +779,7 @@ function readModelSettingsSync(user = null) {
     return { activeProfileId: envProfile.id, profiles: [envProfile] };
   }
   try {
-    const record = JSON.parse(fs.readFileSync(configPath, "utf8"));
+    const record = stored;
     if (!record || typeof record !== "object" || !Array.isArray(record.profiles)) {
       throw new Error("Model configuration has an invalid root structure.");
     }
@@ -758,6 +816,11 @@ function publicModelSettings(settings = readModelSettingsSync()) {
 }
 
 async function writeModelSettings(input = {}, user = null) {
+  if (!user?.id) {
+    const error = new Error("A user-owned model configuration is required.");
+    error.status = 403;
+    throw error;
+  }
   const existing = readModelSettingsSync(user);
   const existingById = new Map(existing.profiles.map((profile) => [profile.id, profile]));
   const rawProfiles = Array.isArray(input.profiles) && input.profiles.length ? input.profiles : existing.profiles;
@@ -766,8 +829,22 @@ async function writeModelSettings(input = {}, user = null) {
     return normalizeModelProfile(profile, existingById.get(profile.id), credentialProfile);
   });
   if (user) {
+    if (profiles.length > publicModelProfileLimit) {
+      const error = new Error(`At most ${publicModelProfileLimit} model profiles are allowed.`);
+      error.status = 429;
+      error.code = "QUOTA_EXCEEDED";
+      throw error;
+    }
     for (const profile of profiles) {
       profile.baseUrl = assertTrustedModelBaseUrl(profile.baseUrl);
+      const hostname = new URL(profile.baseUrl).hostname.toLowerCase();
+      const loopback = new Set(["localhost", "127.0.0.1", "[::1]"]).has(hostname);
+      if (!loopback && !profile.apiKey) {
+        const error = new Error("A user-owned API key is required for remote model endpoints.");
+        error.status = 400;
+        error.code = "BYOK_REQUIRED";
+        throw error;
+      }
     }
   }
   if (!profiles.length) profiles.push(envModelProfile());
@@ -775,9 +852,7 @@ async function writeModelSettings(input = {}, user = null) {
     ? input.activeProfileId
     : profiles[0].id;
   const settings = { activeProfileId, profiles };
-  const configPath = user ? userModelConfigPath(user) : modelConfigPath;
-  await fsp.mkdir(path.dirname(configPath), { recursive: true });
-  await writeJson(configPath, settings);
+  filmDb.replaceModelSettings(user.id, settings);
   return settings;
 }
 
@@ -821,6 +896,12 @@ function getCallableAiConfigs(user = null) {
     seen.add(profile.id);
     if (!profile.apiKey && profile.authScheme !== "none") continue;
     callable.push(profile);
+  }
+  if (!callable.length && user) {
+    const error = new Error("Configure a user-owned model API key before starting a Film Run.");
+    error.status = 400;
+    error.code = "BYOK_REQUIRED";
+    throw error;
   }
   return callable.length ? callable : [active];
 }
@@ -993,30 +1074,32 @@ async function pathStats(filePath) {
 
 async function ensurePrivateRuntimePermissions() {
   await fsp.chmod(userDataRoot, 0o700).catch(() => {});
+  await fsp.chmod(projectsRoot, 0o700).catch(() => {});
   await Promise.all([
     path.join(__dirname, ".env"),
     usersPath,
     modelConfigPath
   ].map((filePath) => fsp.chmod(filePath, 0o600).catch(() => {})));
-  const userEntries = await fsp.readdir(userDataRoot, { withFileTypes: true }).catch(() => []);
-  for (const entry of userEntries) {
-    if (!entry.isDirectory()) continue;
-    const userPath = resolveInside(userDataRoot, entry.name);
-    await fsp.chmod(userPath, 0o700).catch(() => {});
-    const files = await listFilesRecursive(userPath).catch(() => []);
-    for (const filePath of files) {
-      await fsp.chmod(filePath, 0o600).catch(() => {});
-    }
-    const directories = [path.join(userPath, "agent-memory")];
-    while (directories.length) {
-      const directory = directories.pop();
-      const stat = await pathStats(directory);
-      if (!stat?.isDirectory()) continue;
-      await fsp.chmod(directory, 0o700).catch(() => {});
-      const children = await fsp.readdir(directory, { withFileTypes: true }).catch(() => []);
-      for (const child of children) {
-        if (child.isDirectory()) directories.push(path.join(directory, child.name));
+  await hardenRuntimeTree(projectsRoot);
+  await hardenRuntimeTree(userDataRoot);
+}
+
+async function hardenRuntimeTree(root) {
+  const pending = [root];
+  while (pending.length) {
+    const directory = pending.pop();
+    await fsp.chmod(directory, 0o700);
+    for (const entry of await fsp.readdir(directory, { withFileTypes: true })) {
+      const entryPath = resolveInside(root, path.relative(root, path.join(directory, entry.name)));
+      const stat = await fsp.lstat(entryPath);
+      if (stat.isSymbolicLink()) {
+        const error = new Error("Symbolic links are forbidden in private runtime storage.");
+        error.status = 503;
+        error.code = "RUNTIME_SYMLINK_FORBIDDEN";
+        throw error;
       }
+      if (stat.isDirectory()) pending.push(entryPath);
+      else if (stat.isFile()) await fsp.chmod(entryPath, 0o600);
     }
   }
 }
@@ -1092,7 +1175,8 @@ function projectIdFromParts(runIdPrefix, name) {
 }
 
 function isProjectDirectoryName(name) {
-  return new RegExp(`^${runIdPattern()}-.+`).test(String(name || ""));
+  return /^prj-[a-f0-9-]{36}$/i.test(String(name || ""))
+    || new RegExp(`^${runIdPattern()}-.+`).test(String(name || ""));
 }
 
 function resolveAgentWorkspace(agent) {
@@ -1263,24 +1347,6 @@ async function patchProjectRunReferences(projectId) {
   await Promise.all(entries
     .filter((entry) => entry.isDirectory())
     .map((entry) => patchRunProjectReferences(path.join(runsPath, entry.name), projectId)));
-}
-
-async function patchProjectConversationReferences(projectId) {
-  const conversationPath = path.join(projectsRoot, projectId, "_conversations");
-  const entries = await fsp.readdir(conversationPath, { withFileTypes: true }).catch(() => []);
-  await Promise.all(entries
-    .filter((entry) => entry.isFile() && entry.name.endsWith(".json"))
-    .map(async (entry) => {
-      const filePath = path.join(conversationPath, entry.name);
-      const record = await readJsonIfExists(filePath).catch(() => null);
-      if (!record) return;
-      record.projectId = projectId;
-      if (Array.isArray(record.turns)) {
-        record.turns = record.turns.map((turn) => ({ ...turn, projectId }));
-      }
-      await writeJson(filePath, record);
-      await fsp.writeFile(path.join(conversationPath, entry.name.replace(/\.json$/, ".md")), `${conversationArchiveMarkdown(record)}\n`, "utf8");
-    }));
 }
 
 async function copyMissingTemplateStructure(templatePath, projectPath) {
@@ -1737,49 +1803,68 @@ async function getProjectProgress(projectId) {
   };
 }
 
-function projectMetaPath(projectId) {
-  return path.join(projectsRoot, projectId, "_project_meta.json");
-}
-
 async function readProjectMeta(projectId) {
-  const filePath = projectMetaPath(projectId);
-  let raw;
   try {
-    raw = await fsp.readFile(filePath, "utf8");
+    const row = filmDb.getProject(projectId);
+    return row ? {
+      projectId: row.id,
+      ownerUserId: row.owner_user_id,
+      storagePath: row.storage_path,
+      displayName: row.display_name,
+      createdAt: row.created_at,
+      updatedAt: row.updated_at,
+      storageBytes: row.storage_bytes
+    } : null;
   } catch (cause) {
-    if (cause?.code === "ENOENT") return null;
-    const error = new Error("Project ownership metadata is unavailable.", { cause });
+    const error = new Error("Project ownership database is unavailable.", { cause });
     error.status = 503;
     error.code = "PROJECT_META_UNAVAILABLE";
-    throw error;
-  }
-  try {
-    const meta = JSON.parse(normalizeText(raw));
-    if (!meta || typeof meta !== "object" || !String(meta.ownerUserId || "").trim()) {
-      throw new Error("Project ownership metadata has an invalid root structure.");
-    }
-    return meta;
-  } catch (cause) {
-    const error = new Error("Project ownership metadata is invalid.", { cause });
-    error.status = 503;
-    error.code = "PROJECT_META_INVALID";
     throw error;
   }
 }
 
 async function writeProjectMeta(projectId, meta) {
-  await writeJson(projectMetaPath(projectId), {
-    ...meta,
-    projectId,
-    updatedAt: new Date().toISOString()
+  const current = filmDb.getProject(projectId);
+  if (!current) {
+    filmDb.createProject({
+      id: projectId,
+      ownerUserId: meta.ownerUserId,
+      storagePath: meta.storagePath || projectId,
+      displayName: meta.displayName || parseProjectFolderName(projectId).editableName || projectId,
+      createdAt: meta.createdAt || new Date().toISOString(),
+      storageBytes: meta.storageBytes || 0
+    });
+    return;
+  }
+  filmDb.updateProject(projectId, {
+    displayName: meta.displayName ?? current.display_name,
+    storageBytes: meta.storageBytes ?? current.storage_bytes
   });
+}
+
+async function refreshProjectStorage(projectId) {
+  const project = filmDb.getProject(projectId);
+  if (!project) return 0;
+  const projectPath = resolveInside(projectsRoot, project.storage_path);
+  let total = 0;
+  for (const filePath of await listFilesRecursive(projectPath)) {
+    const stat = await fsp.lstat(filePath);
+    if (stat.isSymbolicLink()) {
+      const error = new Error("Symbolic links are forbidden in project storage.");
+      error.status = 403;
+      error.code = "SYMLINK_FORBIDDEN";
+      throw error;
+    }
+    if (stat.isFile()) total += stat.size;
+  }
+  filmDb.updateProject(projectId, { storageBytes: total });
+  return total;
 }
 
 async function projectBelongsToUser(projectId, user) {
   if (!user?.id) return false;
   const meta = await readProjectMeta(projectId);
-  if (!meta?.ownerUserId) return normalizeEmail(user.email) === defaultOwnerEmail;
-  return meta.ownerUserId === user.id;
+  return Boolean(meta && meta.ownerUserId === user.id);
 }
 
 async function requireProjectAccess(projectId, user) {
@@ -1798,6 +1883,13 @@ async function getProjectSummary(projectId) {
   const stat = await pathStats(projectPath);
   if (!stat?.isDirectory()) return null;
   const parsed = parseProjectFolderName(resolvedProjectId);
+  const meta = await readProjectMeta(resolvedProjectId);
+  if (!meta) {
+    const error = new Error("Project is missing from the ownership database.");
+    error.status = 503;
+    error.code = "PROJECT_META_UNAVAILABLE";
+    throw error;
+  }
 
   const [brief, status, files, progress] = await Promise.all([
     readTextIfExists(path.join(projectPath, "00_admin", "PROJECT_BRIEF.md"), 1800),
@@ -1812,9 +1904,9 @@ async function getProjectSummary(projectId) {
 
   return {
     id: resolvedProjectId,
-    title: parsed.editableName || extractTitle(brief || status, resolvedProjectId),
+    title: meta.displayName || parsed.editableName || extractTitle(brief || status, resolvedProjectId),
     runIdPrefix: parsed.runIdPrefix,
-    editableName: parsed.editableName,
+    editableName: meta.displayName || parsed.editableName,
     brief: truncate(brief || status, 1000),
     progress: progress?.summary || null,
     fileCount: files.length,
@@ -1823,16 +1915,9 @@ async function getProjectSummary(projectId) {
 }
 
 async function listProjects(user = null) {
-  const entries = await fsp.readdir(projectsRoot, { withFileTypes: true }).catch(() => []);
-  const ownedEntries = [];
-  for (const entry of entries) {
-    if (!entry.isDirectory() || !isProjectDirectoryName(entry.name)) continue;
-    if (user && !(await projectBelongsToUser(entry.name, user))) continue;
-    ownedEntries.push(entry);
-  }
-  const summaries = await Promise.all(entries
-    .filter((entry) => ownedEntries.some((owned) => owned.name === entry.name))
-    .map((entry) => getProjectSummary(entry.name)));
+  if (!user?.id) return [];
+  const rows = filmDb.listProjects(user.id);
+  const summaries = await Promise.all(rows.map((row) => getProjectSummary(row.id)));
   const uniqueById = new Map();
   for (const summary of summaries.filter(Boolean)) {
     const existing = uniqueById.get(summary.id);
@@ -1905,7 +1990,8 @@ async function getProjectWorkflowState(projectId) {
 async function getProjectFile(projectId, relativePath) {
   const resolvedProjectId = await resolveProjectId(projectId);
   const projectPath = resolveInside(projectsRoot, resolvedProjectId);
-  const filePath = resolveInside(projectPath, relativePath);
+  const normalizedPath = assertWebEditableProjectPath(relativePath);
+  const filePath = resolveInside(projectPath, normalizedPath);
   const stat = await pathStats(filePath);
   if (!stat || !stat.isFile()) {
     const error = new Error("Project file not found.");
@@ -1988,10 +2074,36 @@ async function saveProjectFile(projectId, relativePath, content, expectedHash) {
     error.code = "PROJECT_FILE_CONFLICT";
     throw error;
   }
-  await backupProjectDocument(projectPath, normalizedPath, `web-${createRunId()}`);
-  await fsp.mkdir(path.dirname(filePath), { recursive: true });
-  await atomicWriteText(filePath, normalizeText(content));
-  return getProjectFile(resolvedProjectId, normalizedPath);
+  const project = filmDb.getProject(resolvedProjectId);
+  const owner = project
+    ? readUsersSync().users.find((user) => user.id === project.owner_user_id)
+    : null;
+  const incomingBytes = Buffer.byteLength(normalizeText(content), "utf8");
+  if (!project || !owner) {
+    const error = new Error("Project ownership is unavailable.");
+    error.status = 503;
+    error.code = "PROJECT_META_UNAVAILABLE";
+    throw error;
+  }
+  const storageReservation = filmDb.reserveStorage({
+    ownerUserId: owner.id,
+    projectId: resolvedProjectId,
+    bytes: Math.max(1, incomingBytes),
+    accountLimit: accountStorageLimitFor(owner),
+    projectLimit: owner.role === "admin" ? assetProjectLimitBytes : publicStorageLimitBytes
+  });
+  try {
+    await backupProjectDocument(projectPath, normalizedPath, `web-${createRunId()}`);
+    await fsp.mkdir(path.dirname(filePath), { recursive: true });
+    await atomicWriteText(filePath, normalizeText(content));
+    await refreshProjectStorage(resolvedProjectId);
+    filmDb.finishStorageReservation(storageReservation.id, true);
+    return getProjectFile(resolvedProjectId, normalizedPath);
+  } catch (error) {
+    await refreshProjectStorage(resolvedProjectId).catch(() => {});
+    filmDb.finishStorageReservation(storageReservation.id, false);
+    throw error;
+  }
 }
 
 async function getProjectAssets(projectId) {
@@ -2050,64 +2162,70 @@ async function getAgentMemoryAndSkills(user = null) {
   }));
 }
 
-async function getRecentRuns(limit = 20, projectId = "", user = null) {
+async function getRecentRuns(limit = 20, projectId = "", user = null, offset = 0) {
+  if (!user?.id) return [];
   const resolvedProjectId = projectId ? await resolveProjectId(projectId) : "";
-  const projectEntries = resolvedProjectId
-    ? [{ name: resolvedProjectId, isDirectory: () => true }]
-    : (await fsp.readdir(projectsRoot, { withFileTypes: true }).catch(() => []))
-        .filter((entry) => entry.isDirectory() && isProjectDirectoryName(entry.name));
-  const allowedProjectEntries = [];
-  for (const projectEntry of projectEntries) {
-    if (user && !(await projectBelongsToUser(projectEntry.name, user))) continue;
-    allowedProjectEntries.push(projectEntry);
-  }
-  const runs = (await Promise.all(allowedProjectEntries.map(async (projectEntry) => {
-    const runEntries = await fsp.readdir(projectRunsPath(projectEntry.name), { withFileTypes: true }).catch(() => []);
-    return Promise.all(runEntries
-      .filter((entry) => entry.isDirectory())
-      .map(async (entry) => {
-        const runPath = path.join(projectRunsPath(projectEntry.name), entry.name);
+  const indexedRuns = filmDb.listRuns({
+    ownerUserId: user.id,
+    projectId: resolvedProjectId,
+    limit,
+    offset
+  });
+  return Promise.all(indexedRuns.map(async (indexed) => {
+        const runPath = resolveInside(projectsRoot, indexed.storage_path);
         const stat = await pathStats(runPath);
         const route = await readJsonIfExists(path.join(runPath, "ROUTE.json")).catch(() => null);
         const status = await readJsonIfExists(path.join(runPath, "STATUS.json")).catch(() => null);
-        const children = await getRunChildren(entry.name);
         return {
-          id: entry.name,
-          createdAt: status?.createdAt || stat?.birthtime?.toISOString() || stat?.ctime?.toISOString() || null,
-          updatedAt: status?.updatedAt || stat?.mtime?.toISOString() || null,
-          status: status?.status || "done",
+          id: indexed.run_id,
+          createdAt: status?.createdAt || indexed.created_at,
+          updatedAt: status?.updatedAt || indexed.updated_at || stat?.mtime?.toISOString() || null,
+          status: status?.status || indexed.status,
           currentStage: status?.currentStage || "archive",
           prompt: route?.prompt || "",
-          projectId: route?.projectId || projectEntry.name,
-          parentRunId: route?.parentRunId || status?.parentRunId || null,
-          childRunCount: children.length,
+          projectId: indexed.project_id,
+          parentRunId: indexed.parent_run_id || null,
+          childRunCount: Number(indexed.child_run_count || 0),
           selectedAgents: route?.selectedAgents || []
         };
-      }));
-  }))).flat();
-
-  return runs
-    .filter((run) => !resolvedProjectId || run.projectId === resolvedProjectId)
-    .sort((a, b) => String(b.createdAt).localeCompare(String(a.createdAt)))
-    .slice(0, limit);
+  }));
 }
 
 async function findRunLocation(runId) {
-  const projects = await fsp.readdir(projectsRoot, { withFileTypes: true }).catch(() => []);
-  for (const projectEntry of projects) {
-    if (!projectEntry.isDirectory() || !isProjectDirectoryName(projectEntry.name)) continue;
-    const runPath = path.join(projectRunsPath(projectEntry.name), runId);
-    const stat = await pathStats(runPath);
-    if (stat?.isDirectory()) {
-      return { projectId: projectEntry.name, runPath };
+  let indexed = filmDb.findRun(runId);
+  if (!indexed && testMode) {
+    for (const user of readUsersSync().users) {
+      for (const project of filmDb.listProjects(user.id)) {
+        const candidate = path.join(projectRunsPath(project.id), runId);
+        const stat = await pathStats(candidate);
+        if (!stat?.isDirectory()) continue;
+        const route = await readJsonIfExists(path.join(candidate, "ROUTE.json")).catch(() => null);
+        const status = await readJsonIfExists(path.join(candidate, "STATUS.json")).catch(() => null);
+        filmDb.indexRun({
+          runId,
+          projectId: project.id,
+          storagePath: path.relative(projectsRoot, candidate),
+          parentRunId: route?.parentRunId || status?.parentRunId || null,
+          status: status?.status || "unknown",
+          createdAt: status?.createdAt || stat.birthtime.toISOString(),
+          updatedAt: status?.updatedAt || stat.mtime.toISOString()
+        });
+        indexed = filmDb.findRun(runId);
+        break;
+      }
+      if (indexed) break;
     }
   }
-  const legacyRunPath = path.join(legacyRunsRoot, runId);
-  const legacyStat = await pathStats(legacyRunPath);
-  if (legacyStat?.isDirectory()) {
-    return { projectId: "", runPath: legacyRunPath };
+  if (!indexed) return null;
+  const runPath = resolveInside(projectsRoot, indexed.storage_path);
+  const stat = await pathStats(runPath);
+  if (!stat?.isDirectory()) {
+    const error = new Error("Run index points to unavailable storage.");
+    error.status = 503;
+    error.code = "RUN_STORAGE_UNAVAILABLE";
+    throw error;
   }
-  return null;
+  return { projectId: indexed.project_id, runPath };
 }
 
 async function getRunChildren(runId) {
@@ -3862,9 +3980,8 @@ function resolveAgentOutputPath(agentId, requestedPath) {
   return mapRequestedPathToAllowed(agentId, requestedPath);
 }
 
-function normalizeAgentFilePlan({ agent, runId, prompt, reason, directorText, rawText }) {
+function normalizeAgentFilePlan({ agent, rawText }) {
   const parsed = extractJsonObject(rawText);
-  const writable = getWritableDeliverables(agent.id);
   const rawFiles = Array.isArray(parsed?.files)
     ? parsed.files
     : Array.isArray(parsed?.deliverables)
@@ -3879,7 +3996,7 @@ function normalizeAgentFilePlan({ agent, runId, prompt, reason, directorText, ra
   const files = [];
   const used = new Set();
 
-  for (const [index, rawFile] of rawFiles.entries()) {
+  for (const rawFile of rawFiles) {
     const requestedPath = typeof rawFile === "string" ? rawFile : rawFile?.path || rawFile?.relativePath;
     const relativePath = resolveAgentOutputPath(agent.id, requestedPath);
     if (!relativePath || used.has(relativePath)) continue;
@@ -4120,10 +4237,6 @@ function draftManifestPath(projectId, runId) {
   return resolveInside(projectRunsPath(projectId), runId, "DRAFT_MANIFEST.json");
 }
 
-async function readDraftManifest(projectId, runId) {
-  return readJsonIfExists(draftManifestPath(projectId, runId)).catch(() => null);
-}
-
 async function stageAgentDrafts({ projectId, runId, agent, prompt, files, summary }) {
   const resolvedProjectId = await requireProjectDirectory(projectId);
   const projectPath = resolveInside(projectsRoot, resolvedProjectId);
@@ -4280,7 +4393,7 @@ async function runAgentModel({ runId, projectId, agent, prompt, reason, context,
  * If no explicit requests are provided but the agent is casting and CHARACTER_REFERENCES/ is empty,
  * it falls back to auto-generating character images from CHARACTER_BIBLE.md content.
  */
-async function postProcessAgentImageGeneration({ agentId, projectId, agentResult, runId }) {
+async function postProcessAgentImageGeneration({ agentId, projectId, agentResult, ownerUserId }) {
   const generatedFiles = [];
   if (!agentAssetGenerationEnabled) return generatedFiles;
   const stage = workflowStageForAgent(agentId);
@@ -4303,7 +4416,7 @@ async function postProcessAgentImageGeneration({ agentId, projectId, agentResult
         const prompt = String(req.prompt || "").trim();
         if (!prompt) continue;
 
-        const asset = await createAssetVersion({ projectId, action, type, relativePath, secondRelativePath, prompt });
+        const asset = await createAssetVersion({ projectId, action, type, relativePath, secondRelativePath, prompt, ownerUserId });
         if (asset?.relativePath) generatedFiles.push(asset.relativePath);
         if (asset?.files) generatedFiles.push(...asset.files);
         console.log(`[post-process] Generated image: ${asset?.relativePath || "unknown"}`);
@@ -4349,7 +4462,7 @@ async function postProcessAgentImageGeneration({ agentId, projectId, agentResult
 
     console.log(`[post-process] casting: Auto-generating ${characters.length} character reference image(s) for project ${projectId}`);
 
-    for (const character of characters) {
+    for (const character of characters.slice(0, maxAgentAssetRequests)) {
       try {
         const prompt = buildCharacterImagePrompt(character, stylePrefix);
         if (!prompt) continue;
@@ -4360,7 +4473,8 @@ async function postProcessAgentImageGeneration({ agentId, projectId, agentResult
           type: "image",
           relativePath: "",
           secondRelativePath: "",
-          prompt
+          prompt,
+          ownerUserId
         });
         if (asset?.relativePath) generatedFiles.push(asset.relativePath);
         if (asset?.files) generatedFiles.push(...asset.files);
@@ -4575,7 +4689,8 @@ async function executeLocalAgentWork({ runId, projectId, route, context, prompt,
           agentId,
           projectId,
           agentResult,
-          runId
+          runId,
+          ownerUserId: account?.id
         });
         for (const imgPath of generatedImages) {
           if (imgPath && !writtenFiles.includes(imgPath)) writtenFiles.push(imgPath);
@@ -4724,6 +4839,15 @@ async function writeRunRecord({ runId, prompt, projectId, parentRunId, route, te
     path: path.relative(repoRoot, path.join(runPath, name)),
     relativePath: path.relative(repoRoot, path.join(runPath, name))
   }));
+  filmDb.indexRun({
+    runId,
+    projectId: resolvedProjectId,
+    storagePath: path.relative(projectsRoot, runPath),
+    parentRunId: parentRunId || null,
+    status: status.status || "done",
+    createdAt: status.createdAt || routeRecord.createdAt,
+    updatedAt: status.updatedAt || status.createdAt || routeRecord.createdAt
+  });
 
   return {
     runId,
@@ -4782,69 +4906,80 @@ function cryptoRandom(size) {
 }
 
 async function createProject({ title, prompt, ownerUserId = "" }) {
-  const projectId = projectIdFromParts(createRunId(), title || defaultProjectName);
+  if (!ownerUserId) {
+    const error = new Error("Project owner is required.");
+    error.status = 403;
+    throw error;
+  }
+  const owner = readUsersSync().users.find((user) => user.id === ownerUserId);
+  if (!owner) {
+    const error = new Error("Project owner is unavailable.");
+    error.status = 503;
+    error.code = "PROJECT_META_UNAVAILABLE";
+    throw error;
+  }
+  const projectId = `prj-${randomUUID()}`;
+  const displayName = String(title || defaultProjectName).trim().slice(0, 120) || defaultProjectName;
   const templatePath = projectTemplateRoot;
   const projectPath = resolveInside(projectsRoot, projectId);
   if (fs.existsSync(projectPath)) {
     throw new Error(`Project already exists: ${projectId}`);
   }
-
-  await copyMissingTemplateStructure(templatePath, projectPath);
-  if (ownerUserId) {
-    await writeProjectMeta(projectId, {
+  const createdAt = new Date().toISOString();
+  const storageReservation = filmDb.reserveStorage({
+    ownerUserId,
+    bytes: projectCreationStorageReservationBytes,
+    accountLimit: accountStorageLimitFor(owner)
+  });
+  try {
+    filmDb.createProjectWithQuota({
+      id: projectId,
       ownerUserId,
-      createdAt: new Date().toISOString()
+      storagePath: projectId,
+      displayName,
+      createdAt,
+      projectLimit: publicProjectLimit,
+      accountStorageLimit: accountStorageLimitFor(owner)
     });
+    await copyMissingTemplateStructure(templatePath, projectPath);
+    await fsp.mkdir(projectRunsPath(projectId), { recursive: true });
+    const briefPath = path.join(projectPath, "00_admin", "PROJECT_BRIEF.md");
+    const brief = [
+      `# ${displayName} 项目简报`,
+      "",
+      `创建时间：${new Date().toISOString()}`,
+      `项目 ID：${projectId}`,
+      "",
+      "## 原始需求",
+      prompt || "待填写",
+      "",
+      "## 后端动作",
+      "- 已从标准项目模板初始化目录结构，模板正文不会计入项目进度。",
+      "- 后续由 `/api/film/task` 继续进行总导演调度和 Agent 路由。"
+    ].join("\n");
+    await fsp.writeFile(briefPath, `${brief}\n`, { encoding: "utf8", mode: 0o600 });
+    await fsp.chmod(briefPath, 0o600);
+    await refreshProjectStorage(projectId);
+    filmDb.finishStorageReservation(storageReservation.id, true);
+    return getProjectSummary(projectId);
+  } catch (error) {
+    filmDb.finishStorageReservation(storageReservation.id, false);
+    filmDb.deleteProject(projectId);
+    await fsp.rm(projectPath, { recursive: true, force: true }).catch(() => {});
+    throw error;
   }
-  await fsp.mkdir(projectRunsPath(projectId), { recursive: true });
-  const briefPath = path.join(projectPath, "00_admin", "PROJECT_BRIEF.md");
-  const brief = [
-    `# ${parseProjectFolderName(projectId).editableName} 项目简报`,
-    "",
-    `创建时间：${new Date().toISOString()}`,
-    `项目 ID：${projectId}`,
-    "",
-    "## 原始需求",
-    prompt || "待填写",
-    "",
-    "## 后端动作",
-    "- 已从标准项目模板初始化目录结构，模板正文不会计入项目进度。",
-    "- 后续由 `/api/film/task` 继续进行总导演调度和 Agent 路由。"
-  ].join("\n");
-  await fsp.writeFile(briefPath, `${brief}\n`, "utf8");
-
-  return getProjectSummary(projectId);
 }
 
 async function renameProject(projectId, nextName) {
   const resolvedProjectId = await resolveProjectId(projectId);
-  const current = parseProjectFolderName(resolvedProjectId);
-  if (!current.runIdPrefix) {
-    const error = new Error("Project id does not use the required <runId>-name format.");
-    error.status = 400;
+  const displayName = String(nextName || defaultProjectName).trim().slice(0, 120) || defaultProjectName;
+  if (!filmDb.updateProject(resolvedProjectId, { displayName })) {
+    const error = new Error("Project is missing from the ownership database.");
+    error.status = 503;
+    error.code = "PROJECT_META_UNAVAILABLE";
     throw error;
   }
-  const newProjectId = projectIdFromParts(current.runIdPrefix, nextName || defaultProjectName);
-  if (newProjectId === resolvedProjectId) return getProjectSummary(resolvedProjectId);
-
-  const currentPath = resolveInside(projectsRoot, resolvedProjectId);
-  const nextPath = resolveInside(projectsRoot, newProjectId);
-  if (await pathStats(nextPath)) {
-    const error = new Error(`Project already exists: ${newProjectId}`);
-    error.status = 409;
-    throw error;
-  }
-
-  await fsp.rename(currentPath, nextPath);
-  await patchProjectRunReferences(newProjectId);
-  await patchProjectConversationReferences(newProjectId);
-  const migration = await readMigrationMap();
-  for (const [legacyId, mappedId] of Object.entries(migration.projects || {})) {
-    if (mappedId === resolvedProjectId) migration.projects[legacyId] = newProjectId;
-  }
-  migration.projects[resolvedProjectId] = newProjectId;
-  await writeMigrationMap(migration);
-  return getProjectSummary(newProjectId);
+  return getProjectSummary(resolvedProjectId);
 }
 
 async function processFilmTaskUnlocked({ prompt, requestedProjectId, parentRunId = null, account = null }) {
@@ -4866,6 +5001,9 @@ async function processFilmTaskUnlocked({ prompt, requestedProjectId, parentRunId
     throw error;
   }
   await requireProjectAccess(projectId, account);
+  // BYOK is an authorization boundary, not a recoverable provider failure. Reject
+  // before creating a Run so a public account can never fall through to server keys.
+  getCallableAiConfigs(account);
 
   const projectProgress = await getProjectProgress(projectId).catch(() => null);
   const route = routePrompt(prompt, projectProgress);
@@ -5045,19 +5183,50 @@ async function withProjectTaskLock(projectId, action) {
 }
 
 async function processFilmTask(options) {
-  return withProjectTaskLock(options.requestedProjectId, async () => {
-    if (activeFilmTaskCount >= maxConcurrentFilmTasks) {
-      const error = new Error("The global film task concurrency limit has been reached.");
-      error.status = 429;
-      throw error;
+  // Reject accounts without a callable user-owned model before reserving quota.
+  // processFilmTaskUnlocked repeats this check as a defense-in-depth boundary.
+  getCallableAiConfigs(options.account);
+  const quotaProjectId = await resolveProjectId(options.requestedProjectId);
+  await requireProjectAccess(quotaProjectId, options.account);
+  let reservation = null;
+  let storageReservation = null;
+  try {
+    reservation = options.quotaAlreadyReserved
+      ? null
+      : filmDb.reserveDailyUsage(options.account.id, "film_run", 1, publicDailyFilmRunLimit);
+    storageReservation = filmDb.reserveStorage({
+      ownerUserId: options.account.id,
+      projectId: quotaProjectId,
+      bytes: filmRunStorageReservationBytes,
+      accountLimit: accountStorageLimitFor(options.account),
+      projectLimit: options.account.role === "admin" ? assetProjectLimitBytes : publicStorageLimitBytes
+    });
+    const result = await withProjectTaskLock(quotaProjectId, async () => {
+      if (activeFilmTaskCount >= maxConcurrentFilmTasks) {
+        const error = new Error("The global film task concurrency limit has been reached.");
+        error.status = 429;
+        error.code = "QUOTA_EXCEEDED";
+        throw error;
+      }
+      activeFilmTaskCount += 1;
+      try {
+        return await processFilmTaskUnlocked({ ...options, requestedProjectId: quotaProjectId });
+      } finally {
+        activeFilmTaskCount -= 1;
+      }
+    });
+    await refreshProjectStorage(quotaProjectId);
+    filmDb.finishStorageReservation(storageReservation.id, true);
+    if (reservation) filmDb.finishUsageReservation(reservation.id, true);
+    return result;
+  } catch (error) {
+    if (reservation) filmDb.finishUsageReservation(reservation.id, false);
+    if (storageReservation) {
+      const indexed = await refreshProjectStorage(quotaProjectId).then(() => true).catch(() => false);
+      if (indexed) filmDb.finishStorageReservation(storageReservation.id, false);
     }
-    activeFilmTaskCount += 1;
-    try {
-      return await processFilmTaskUnlocked(options);
-    } finally {
-      activeFilmTaskCount -= 1;
-    }
-  });
+    throw error;
+  }
 }
 
 const filmTaskJobs = new Map();
@@ -5076,10 +5245,6 @@ function cleanupFilmTaskJobs() {
   }
 }
 
-function filmTaskJobPath(ownerUserId, jobId) {
-  return resolveInside(userDataRoot, ownerUserId, "jobs", `${jobId}.json`);
-}
-
 function persistedFilmTaskJob(job) {
   const { account: _account, ...record } = job;
   return record;
@@ -5087,39 +5252,28 @@ function persistedFilmTaskJob(job) {
 
 async function persistFilmTaskJob(job) {
   if (!job?.ownerUserId) return;
-  const filePath = filmTaskJobPath(job.ownerUserId, job.jobId);
-  await fsp.mkdir(path.dirname(filePath), { recursive: true, mode: 0o700 });
-  await fsp.chmod(path.dirname(filePath), 0o700);
-  await writeJson(filePath, persistedFilmTaskJob(job));
+  filmDb.saveJob("film", persistedFilmTaskJob(job));
 }
 
 async function loadFilmTaskJobForUser(user, jobId) {
   if (!user?.id) return null;
-  const record = await readJsonIfExists(filmTaskJobPath(user.id, jobId)).catch(() => null);
+  const record = filmDb.getJob("film", jobId, user.id);
   if (!record || record.ownerUserId !== user.id || record.jobId !== jobId) return null;
   filmTaskJobs.set(jobId, record);
   return record;
 }
 
 async function recoverPersistedFilmTaskJobs() {
-  const userEntries = await fsp.readdir(userDataRoot, { withFileTypes: true }).catch(() => []);
-  for (const userEntry of userEntries) {
-    if (!userEntry.isDirectory()) continue;
-    const jobsPath = resolveInside(userDataRoot, userEntry.name, "jobs");
-    const jobEntries = await fsp.readdir(jobsPath, { withFileTypes: true }).catch(() => []);
-    for (const entry of jobEntries) {
-      if (!entry.isFile() || !entry.name.endsWith(".json")) continue;
-      const filePath = resolveInside(jobsPath, entry.name);
-      const job = await readJsonIfExists(filePath).catch(() => null);
-      if (!job?.jobId || job.ownerUserId !== userEntry.name) continue;
-      if (job.status === "queued" || job.status === "running") {
-        const endedAt = new Date().toISOString();
-        Object.assign(job, recoverInterruptedJob(job, endedAt));
-        await writeJson(filePath, job);
-      }
-      const age = Date.now() - new Date(job.updatedAt || job.createdAt || 0).getTime();
-      if (age <= filmTaskJobTtlMs) filmTaskJobs.set(job.jobId, job);
+  for (const job of filmDb.listAllJobs("film")) {
+    if (!job?.jobId || !job.ownerUserId) continue;
+    if (job.status === "queued" || job.status === "running") {
+      const endedAt = new Date().toISOString();
+      Object.assign(job, recoverInterruptedJob(job, endedAt));
+      if (job.usageReservationId) filmDb.finishUsageReservation(job.usageReservationId, false);
+      await persistFilmTaskJob(job);
     }
+    const age = Date.now() - new Date(job.updatedAt || job.createdAt || 0).getTime();
+    if (age <= filmTaskJobTtlMs) filmTaskJobs.set(job.jobId, job);
   }
 }
 
@@ -5140,17 +5294,43 @@ function publicFilmTaskJob(job) {
     provider: job.result?.provider || null,
     model: job.result?.model || null,
     result: job.status === "done" ? job.result : null,
-    error: job.status === "error" ? job.error : null,
-    errorPayload: job.status === "error" ? job.errorPayload : null
+    error: job.status === "error" ? {
+      code: job.errorPayload?.code || "FILM_TASK_FAILED",
+      message: "Film task failed."
+    } : null,
+    errorPayload: job.status === "error" ? {
+      ok: false,
+      code: job.errorPayload?.code || "FILM_TASK_FAILED",
+      error: "Film task failed.",
+      projectId: job.errorPayload?.projectId || job.requestedProjectId || null,
+      runId: job.errorPayload?.runId || null
+    } : null
   };
 }
 
-async function startFilmTaskJob({ prompt, requestedProjectId, parentRunId = null, account = null }) {
+async function startFilmTaskJob({ prompt, requestedProjectId, parentRunId = null, account = null, idempotencyKey = "" }) {
   cleanupFilmTaskJobs();
+  const normalizedKey = normalizeAssetIdempotencyKey(idempotencyKey);
+  const requestHash = createHash("sha256").update(JSON.stringify({ prompt, requestedProjectId, parentRunId })).digest("hex");
+  const existing = filmDb.findJobByIdempotency("film", account?.id, normalizedKey);
+  if (existing) {
+    if (existing.requestHash !== requestHash) {
+      const error = new Error("Idempotency-Key was already used for a different film request.");
+      error.status = 409;
+      error.code = "IDEMPOTENCY_CONFLICT";
+      throw error;
+    }
+    filmTaskJobs.set(existing.jobId, existing);
+    return publicFilmTaskJob(existing);
+  }
+  const reservation = filmDb.reserveDailyUsage(account.id, "film_run", 1, publicDailyFilmRunLimit);
   const now = new Date().toISOString();
   const job = {
     jobId: createFilmTaskJobId(),
     ownerUserId: account?.id || null,
+    idempotencyKey: normalizedKey,
+    requestHash,
+    usageReservationId: reservation.id,
     status: "queued",
     prompt,
     requestedProjectId,
@@ -5179,10 +5359,12 @@ async function startFilmTaskJob({ prompt, requestedProjectId, parentRunId = null
         prompt,
         requestedProjectId,
         parentRunId,
-        account: job.account
+        account: job.account,
+        quotaAlreadyReserved: true
       });
       job.status = "done";
       job.error = null;
+      filmDb.finishUsageReservation(job.usageReservationId, true);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       job.status = "error";
@@ -5204,6 +5386,7 @@ async function startFilmTaskJob({ prompt, requestedProjectId, parentRunId = null
         threadEvents: error?.filmTask?.threadEvents || [],
         agentWork: error?.filmTask?.agentWork || []
       };
+      filmDb.finishUsageReservation(job.usageReservationId, false);
       console.warn("[film-task-job] failed", {
         jobId: job.jobId,
         projectId: requestedProjectId,
@@ -5265,7 +5448,27 @@ async function withAssetGenerationSlot(ownerUserId, action) {
   }
 }
 
-function runDreamina(args, { timeoutMs = 10 * 60_000, signal = null } = {}) {
+async function privateDirectorySize(directory) {
+  let total = 0;
+  for (const filePath of await listFilesRecursive(directory)) {
+    const stat = await fsp.lstat(filePath);
+    if (stat.isSymbolicLink()) {
+      const error = new Error("Symbolic links are forbidden in asset job storage.");
+      error.status = 403;
+      error.code = "SYMLINK_FORBIDDEN";
+      throw error;
+    }
+    if (stat.isFile()) total += stat.size;
+  }
+  return total;
+}
+
+function runDreamina(args, {
+  timeoutMs = 10 * 60_000,
+  signal = null,
+  monitorDirectory = "",
+  maxTemporaryBytes = assetJobLimitBytes
+} = {}) {
   return new Promise((resolve, reject) => {
     if (signal?.aborted) {
       const error = new Error("Dreamina task was cancelled.");
@@ -5284,6 +5487,7 @@ function runDreamina(args, { timeoutMs = 10 * 60_000, signal = null } = {}) {
     let outputBytes = 0;
     let settled = false;
     let killTimer = null;
+    let monitorBusy = false;
     const terminateChild = () => {
       child.kill("SIGTERM");
       if (!killTimer) {
@@ -5310,6 +5514,26 @@ function runDreamina(args, { timeoutMs = 10 * 60_000, signal = null } = {}) {
       error.status = 504;
       rejectOnce(error);
     }, timeoutMs);
+    const storageMonitor = monitorDirectory ? setInterval(async () => {
+      if (monitorBusy || settled) return;
+      monitorBusy = true;
+      try {
+        const bytes = await privateDirectorySize(monitorDirectory);
+        if (bytes > maxTemporaryBytes) {
+          terminateChild();
+          const error = new Error("Asset job exceeded its temporary storage quota.");
+          error.status = 413;
+          error.code = "STORAGE_QUOTA_EXCEEDED";
+          rejectOnce(error);
+        }
+      } catch (error) {
+        terminateChild();
+        rejectOnce(error);
+      } finally {
+        monitorBusy = false;
+      }
+    }, 250) : null;
+    storageMonitor?.unref?.();
 
     const appendOutput = (target, chunk) => {
       outputBytes += chunk.length;
@@ -5326,6 +5550,7 @@ function runDreamina(args, { timeoutMs = 10 * 60_000, signal = null } = {}) {
     child.stderr.on("data", (chunk) => { stderr = appendOutput(stderr, chunk); });
     child.on("error", (error) => {
       clearTimeout(timer);
+      if (storageMonitor) clearInterval(storageMonitor);
       if (killTimer) clearTimeout(killTimer);
       signal?.removeEventListener("abort", abortHandler);
       error.status = error.code === "ENOENT" ? 503 : 500;
@@ -5333,6 +5558,7 @@ function runDreamina(args, { timeoutMs = 10 * 60_000, signal = null } = {}) {
     });
     child.on("close", (code) => {
       clearTimeout(timer);
+      if (storageMonitor) clearInterval(storageMonitor);
       if (killTimer) clearTimeout(killTimer);
       signal?.removeEventListener("abort", abortHandler);
       if (settled) return;
@@ -5419,7 +5645,13 @@ async function listMediaFiles(dirPath, allowedExtensions) {
   return files.sort((a, b) => (b.stat?.mtimeMs || 0) - (a.stat?.mtimeMs || 0)).map((item) => item.path);
 }
 
-async function queryDreaminaUntilDone(submitId, downloadDir, allowedExtensions, signal = null) {
+async function queryDreaminaUntilDone(
+  submitId,
+  downloadDir,
+  allowedExtensions,
+  signal = null,
+  { maxTemporaryBytes = assetJobLimitBytes, maxFileBytes = assetVideoLimitBytes } = {}
+) {
   const deadline = Date.now() + Math.max(testMode ? 1 : 30, dreaminaPollSeconds) * 1000;
   let lastPayload = null;
   let lastOutput = "";
@@ -5430,11 +5662,30 @@ async function queryDreaminaUntilDone(submitId, downloadDir, allowedExtensions, 
       "query_result",
       `--submit_id=${submitId}`,
       `--download_dir=${downloadDir}`
-    ], { timeoutMs: dreaminaQueryTimeoutMs, signal });
+    ], {
+      timeoutMs: dreaminaQueryTimeoutMs,
+      signal,
+      monitorDirectory: downloadDir,
+      maxTemporaryBytes
+    });
     lastOutput = result.output;
     lastPayload = parseDreaminaOutput(result.output);
     const status = dreaminaStatus(lastPayload, result.output);
     const downloaded = await listMediaFiles(downloadDir, allowedExtensions);
+    const downloadedStats = await Promise.all(downloaded.map((filePath) => fsp.lstat(filePath)));
+    if (downloadedStats.some((stat) => stat.isSymbolicLink())) {
+      const error = new Error("Symbolic links are forbidden in Dreamina output.");
+      error.status = 403;
+      error.code = "SYMLINK_FORBIDDEN";
+      throw error;
+    }
+    if (downloadedStats.some((stat) => stat.size > maxFileBytes)
+      || downloadedStats.reduce((total, stat) => total + stat.size, 0) > maxTemporaryBytes) {
+      const error = new Error("Generated media exceeds the configured storage quota.");
+      error.status = 413;
+      error.code = "STORAGE_QUOTA_EXCEEDED";
+      throw error;
+    }
 
     if (downloaded.length && (!status || isDreaminaSuccessStatus(status))) {
       return { payload: lastPayload, output: result.output, downloaded };
@@ -5606,6 +5857,7 @@ async function moveDreaminaDownloads({ downloaded, projectPath, outputDir, sourc
       await fsp.copyFile(filePath, target);
       await fsp.rm(filePath, { force: true });
     });
+    await fsp.chmod(target, 0o600);
     moved.push({
       path: target,
       relativePath: path.relative(projectPath, target).split(path.sep).join("/"),
@@ -5639,6 +5891,7 @@ async function writeAssetVersions(projectId, versions) {
 
 async function createAssetVersionUnlocked({
   projectId,
+  ownerUserId,
   action,
   type,
   relativePath,
@@ -5672,6 +5925,21 @@ async function createAssetVersionUnlocked({
     || versions.filter((item) => item.parentRelativePath === parentRelativePath).length + 1;
   const versionId = String(resumeState?.versionId || `${new Date().toISOString().replace(/[:.]/g, "-")}-${cryptoRandom(4)}`);
   const requestedType = type === "video" || normalizedAction.includes("video") ? "video" : "image";
+  const projectRecord = filmDb.getProject(resolvedProjectId);
+  const accountUsage = ownerUserId ? filmDb.usage(ownerUserId) : null;
+  const fileLimitBytes = requestedType === "video" ? assetVideoLimitBytes : assetImageLimitBytes;
+  const projectRemaining = assetProjectLimitBytes - Number(projectRecord?.storage_bytes || 0);
+  const accountRemaining = assetAccountLimitBytes - Number(accountUsage?.storageBytes || 0);
+  const disk = await fsp.statfs(projectsRoot);
+  const freeDiskBytes = Number(disk.bavail) * Number(disk.bsize);
+  const writableDiskBytes = Math.max(0, freeDiskBytes - minimumFreeDiskBytes);
+  const maxTemporaryBytes = Math.min(assetJobLimitBytes, projectRemaining, accountRemaining, writableDiskBytes);
+  if (!projectRecord || projectRecord.owner_user_id !== ownerUserId || maxTemporaryBytes < fileLimitBytes) {
+    const error = new Error("Insufficient project, account, or disk capacity for this asset job.");
+    error.status = 413;
+    error.code = "STORAGE_QUOTA_EXCEEDED";
+    throw error;
+  }
   const generationPrompt = truncate(
     normalizeText(prompt).trim() || await inferDreaminaPrompt({ projectId: resolvedProjectId, requestedType, parentRelativePath }),
     6000
@@ -5751,7 +6019,10 @@ async function createAssetVersionUnlocked({
   )) ? resumedMovedFiles : [];
   if (!movedFiles.length) {
     try {
-      query = await queryDreaminaUntilDone(submitId, downloadDir, dreamina.allowedExtensions, signal);
+      query = await queryDreaminaUntilDone(submitId, downloadDir, dreamina.allowedExtensions, signal, {
+        maxTemporaryBytes,
+        maxFileBytes: fileLimitBytes
+      });
       movedFiles = await moveDreaminaDownloads({
         downloaded: query.downloaded,
         projectPath,
@@ -5808,6 +6079,7 @@ async function createAssetVersionUnlocked({
 
   await appendAssetManifest(resolvedProjectId, record);
   await writeAssetVersions(resolvedProjectId, [record, ...versions]);
+  await refreshProjectStorage(resolvedProjectId);
 
   return {
     ...record,
@@ -5818,7 +6090,40 @@ async function createAssetVersionUnlocked({
 }
 
 async function createAssetVersion(options) {
-  return withAssetGenerationSlot(options.ownerUserId, () => createAssetVersionUnlocked(options));
+  const owner = readUsersSync().users.find((user) => user.id === options.ownerUserId);
+  if (!owner || owner.role !== "admin" || owner.status !== "active") {
+    const error = new Error("Administrator access is required for platform asset generation.");
+    error.status = 403;
+    error.code = "ASSET_ADMIN_REQUIRED";
+    throw error;
+  }
+  const projectId = await resolveProjectId(options.projectId);
+  let reservation = null;
+  let storageReservation = null;
+  try {
+    reservation = filmDb.reserveDailyUsage(owner.id, "dreamina_asset", 1, adminDailyAssetLimit);
+    storageReservation = filmDb.reserveStorage({
+      ownerUserId: owner.id,
+      projectId,
+      bytes: assetJobLimitBytes,
+      accountLimit: assetAccountLimitBytes,
+      projectLimit: assetProjectLimitBytes
+    });
+    const result = await withAssetGenerationSlot(options.ownerUserId, () => createAssetVersionUnlocked({
+      ...options,
+      projectId
+    }));
+    filmDb.finishStorageReservation(storageReservation.id, true);
+    filmDb.finishUsageReservation(reservation.id, true);
+    return result;
+  } catch (error) {
+    if (reservation) filmDb.finishUsageReservation(reservation.id, false);
+    if (storageReservation) {
+      const indexed = await refreshProjectStorage(projectId).then(() => true).catch(() => false);
+      if (indexed) filmDb.finishStorageReservation(storageReservation.id, false);
+    }
+    throw error;
+  }
 }
 
 const assetTaskJobs = new Map();
@@ -5832,15 +6137,8 @@ function createAssetTaskJobId() {
   return `asset-job-${new Date().toISOString().replace(/[:.]/g, "-")}-${cryptoRandom(6)}`;
 }
 
-function assetTaskJobPath(ownerUserId, jobId) {
-  return resolveInside(userDataRoot, ownerUserId, "asset-jobs", `${jobId}.json`);
-}
-
 async function persistAssetTaskJob(job) {
-  const filePath = assetTaskJobPath(job.ownerUserId, job.jobId);
-  await fsp.mkdir(path.dirname(filePath), { recursive: true, mode: 0o700 });
-  await fsp.chmod(path.dirname(filePath), 0o700);
-  await writeJson(filePath, job);
+  filmDb.saveJob("asset", job);
 }
 
 function publicAssetTaskJob(job) {
@@ -5860,7 +6158,10 @@ function publicAssetTaskJob(job) {
     cancelRequested: Boolean(job.cancelRequested),
     progress: job.progress || { phase: "queued", percent: 0 },
     result: job.status === "done" ? job.result : null,
-    error: job.status === "error" ? job.error : null
+    error: job.status === "error" ? {
+      code: job.error?.code || "ASSET_TASK_FAILED",
+      message: "Asset task failed."
+    } : null
   };
 }
 
@@ -5868,7 +6169,7 @@ async function loadAssetTaskJobForUser(user, jobId) {
   if (!user?.id) return null;
   const cached = assetTaskJobs.get(jobId);
   if (cached?.ownerUserId === user.id) return cached;
-  const record = await readJsonIfExists(assetTaskJobPath(user.id, jobId)).catch(() => null);
+  const record = filmDb.getJob("asset", jobId, user.id);
   if (!record || record.ownerUserId !== user.id || record.jobId !== jobId) return null;
   assetTaskJobs.set(jobId, record);
   return record;
@@ -5983,7 +6284,7 @@ function findAssetJobByIdempotency(ownerUserId, idempotencyKey) {
   if (!idempotencyKey) return null;
   return [...assetTaskJobs.values()].find((job) => (
     job.ownerUserId === ownerUserId && job.idempotencyKey === idempotencyKey
-  )) || null;
+  )) || filmDb.findJobByIdempotency("asset", ownerUserId, idempotencyKey);
 }
 
 async function startAssetTaskJob({ ownerUserId, request, idempotencyKey }) {
@@ -6026,26 +6327,17 @@ async function startAssetTaskJob({ ownerUserId, request, idempotencyKey }) {
 }
 
 async function recoverPersistedAssetTaskJobs() {
-  const userEntries = await fsp.readdir(userDataRoot, { withFileTypes: true }).catch(() => []);
-  for (const userEntry of userEntries) {
-    if (!userEntry.isDirectory()) continue;
-    const jobsPath = resolveInside(userDataRoot, userEntry.name, "asset-jobs");
-    const entries = await fsp.readdir(jobsPath, { withFileTypes: true }).catch(() => []);
-    for (const entry of entries) {
-      if (!entry.isFile() || !entry.name.endsWith(".json")) continue;
-      const filePath = resolveInside(jobsPath, entry.name);
-      const job = await readJsonIfExists(filePath).catch(() => null);
-      if (!job?.jobId || job.ownerUserId !== userEntry.name || !job.request?.projectId) continue;
-      if (job.status === "running") {
-        const recoveredAt = new Date().toISOString();
-        Object.assign(job, job.cancelRequested
-          ? { status: "cancelled", endedAt: recoveredAt, updatedAt: recoveredAt }
-          : recoverInterruptedAssetJob(job, recoveredAt));
-        await writeJson(filePath, job);
-      }
-      const age = Date.now() - new Date(job.updatedAt || job.createdAt || 0).getTime();
-      if (["queued", "running"].includes(job.status) || age <= assetTaskJobTtlMs) assetTaskJobs.set(job.jobId, job);
+  for (const job of filmDb.listAllJobs("asset")) {
+    if (!job?.jobId || !job.ownerUserId || !job.request?.projectId) continue;
+    if (job.status === "running") {
+      const recoveredAt = new Date().toISOString();
+      Object.assign(job, job.cancelRequested
+        ? { status: "cancelled", endedAt: recoveredAt, updatedAt: recoveredAt }
+        : recoverInterruptedAssetJob(job, recoveredAt));
+      await persistAssetTaskJob(job);
     }
+    const age = Date.now() - new Date(job.updatedAt || job.createdAt || 0).getTime();
+    if (["queued", "running"].includes(job.status) || age <= assetTaskJobTtlMs) assetTaskJobs.set(job.jobId, job);
   }
   scheduleAssetTaskJobs();
 }
@@ -6055,7 +6347,7 @@ async function getRuntimeSnapshot(projectId, user = null) {
     getStudioStatus(),
     getAgentSummaries(false, user),
     listProjects(user),
-    getRecentRuns(100, projectId, user)
+    getRecentRuns(20, projectId, user)
   ]);
   const activeProjectId = await getActiveProjectId(projectId, user);
   const [activeProject, documents, workflow, assets, agentMemory] = await Promise.all([
@@ -6116,6 +6408,15 @@ await recoverIncompleteApprovalJournals();
 await recoverIncompleteApprovalRollbacks();
 await recoverPersistedAssetTaskJobs();
 if (!testMode) await recoverPersistedFilmTaskJobs();
+filmDb.cleanup();
+const cleanupTimer = setInterval(() => {
+  try {
+    filmDb.cleanup();
+  } catch (error) {
+    console.warn("[cleanup] failed", error instanceof Error ? error.message : String(error));
+  }
+}, 60 * 60_000);
+cleanupTimer.unref?.();
 
 app.use("/api/auth", (_req, res, next) => {
   res.setHeader("Cache-Control", "no-store");
@@ -6123,8 +6424,63 @@ app.use("/api/auth", (_req, res, next) => {
   next();
 });
 
-app.get("/api/auth/recovery/questions", (_req, res) => {
-  res.json({ ok: true, questions: recoveryQuestions });
+app.get("/api/auth/registration/config", (_req, res) => {
+  res.json({
+    ok: true,
+    registrationEnabled: registrationServiceReady(),
+    turnstileSiteKey: registrationServiceReady() ? turnstileSiteKey : ""
+  });
+});
+
+app.post("/api/auth/registration/start", registrationRateLimit, async (req, res) => {
+  if (!registrationServiceReady()) {
+    res.status(403).json({ ok: false, code: "REGISTRATION_DISABLED", error: "Public registration is disabled." });
+    return;
+  }
+  const email = normalizeEmail(req.body?.email);
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) || email.length > 254) {
+    res.status(400).json({ ok: false, code: "INVALID_EMAIL", error: "A valid email address is required." });
+    return;
+  }
+  try {
+    if (!(await verifyTurnstile(req, req.body?.turnstileToken))) {
+      res.status(400).json({ ok: false, code: "TURNSTILE_INVALID", error: "Human verification failed." });
+      return;
+    }
+    const existing = readUsersSync().users.some((user) => user.email === email);
+    if (!existing) {
+      const code = testMode && /^\d{8}$/.test(String(process.env.FILM_TEST_REGISTRATION_CODE || ""))
+        ? String(process.env.FILM_TEST_REGISTRATION_CODE)
+        : generateRegistrationCode();
+      filmDb.createRegistrationChallenge({
+        email,
+        codeHmac: filmDb.verificationCodeHmac(email, code)
+      });
+      await sendRegistrationCode(email, code);
+    }
+    res.status(202).json({
+      ok: true,
+      code: "VERIFICATION_SENT",
+      message: "If the address can be registered, a verification code has been sent."
+    });
+  } catch (error) {
+    const retryAfter = Number(error?.retryAfter || 0);
+    if (retryAfter) res.setHeader("Retry-After", String(retryAfter));
+    res.status(error?.status || 503).json({
+      ok: false,
+      code: error?.code || "REGISTRATION_UNAVAILABLE",
+      error: error?.status === 429 ? error.message : "Registration verification is temporarily unavailable.",
+      ...(retryAfter ? { retryAfter } : {})
+    });
+  }
+});
+
+app.all("/api/auth/recovery/{*path}", (_req, res) => {
+  res.status(410).json({
+    ok: false,
+    code: "RECOVERY_DISABLED",
+    error: "Remote account recovery is disabled. Contact the local administrator."
+  });
 });
 
 app.get("/api/health", async (req, res) => {
@@ -6140,7 +6496,7 @@ app.get("/api/health", async (req, res) => {
     ok: authenticationReady,
     service: serviceName,
     scope: user ? "user" : "global",
-    registrationEnabled,
+    registrationEnabled: registrationServiceReady(),
     authentication: { ready: authenticationReady },
     backend: {
       ok: backend.ok,
@@ -6165,52 +6521,71 @@ app.get("/api/auth/me", async (req, res) => {
   res.json({ ok: true, user: publicUser(user) });
 });
 
+app.get("/api/usage", requireAuth, async (req, res) => {
+  try {
+    for (const project of filmDb.listProjects(req.user.id)) {
+      await refreshProjectStorage(project.id);
+    }
+    const usage = filmDb.usage(req.user.id);
+    res.json({
+      ok: true,
+      usage: {
+        projectCount: usage.projectCount,
+        projectLimit: publicProjectLimit,
+        storageBytes: usage.storageBytes,
+        storageReservedBytes: usage.storageReservedBytes,
+        storageLimitBytes: accountStorageLimitFor(req.user),
+        dailyFilmRuns: usage.counters.film_run || { used: 0, reserved: 0 },
+        dailyFilmRunLimit: publicDailyFilmRunLimit,
+        dailyAssets: usage.counters.dreamina_asset || { used: 0, reserved: 0 },
+        dailyAssetLimit: req.user.role === "admin" ? adminDailyAssetLimit : 0
+      }
+    });
+  } catch {
+    res.status(503).json({ ok: false, code: "USAGE_UNAVAILABLE", error: "Usage information is temporarily unavailable." });
+  }
+});
+
 app.post("/api/auth/register", registrationRateLimit, async (req, res) => {
-  if (!registrationEnabled) {
-    res.status(403).json({ ok: false, error: "Public registration is disabled. Ask an administrator for access." });
+  if (!registrationServiceReady()) {
+    res.status(403).json({ ok: false, code: "REGISTRATION_DISABLED", error: "Public registration is disabled." });
     return;
   }
   const email = normalizeEmail(req.body?.email);
+  const verificationCode = String(req.body?.verificationCode || req.body?.code || "").trim();
   const password = String(req.body?.password || "");
   const repeatPassword = String(req.body?.repeatPassword || req.body?.passwordRepeat || "");
-  const recoveryQuestion = findRecoveryQuestion(req.body?.questionId);
-  const recoveryAnswer = normalizeRecoveryAnswer(req.body?.recoveryAnswer);
   if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
-    res.status(400).json({ ok: false, error: "Valid email is required." });
+    res.status(400).json({ ok: false, code: "REGISTRATION_INVALID", error: "Registration details are invalid." });
     return;
   }
   if (password.length < minimumPasswordLength) {
-    res.status(400).json({ ok: false, error: `Password must be at least ${minimumPasswordLength} characters.` });
+    res.status(400).json({ ok: false, code: "PASSWORD_TOO_SHORT", error: `Password must be at least ${minimumPasswordLength} characters.` });
     return;
   }
   if (password !== repeatPassword) {
-    res.status(400).json({ ok: false, error: "Passwords do not match." });
+    res.status(400).json({ ok: false, code: "PASSWORD_MISMATCH", error: "Passwords do not match." });
     return;
   }
-  if (!recoveryQuestion || recoveryAnswer.length < minimumRecoveryAnswerLength || recoveryAnswer.length > 200) {
-    res.status(400).json({ ok: false, error: `A recovery question and answer between ${minimumRecoveryAnswerLength} and 200 characters are required.` });
+  if (!/^\d{8}$/.test(verificationCode)) {
+    res.status(400).json({ ok: false, code: "VERIFICATION_INVALID", error: "Email or verification code is invalid." });
     return;
   }
 
   try {
-    const [passwordRecord, recoveryRecord] = await Promise.all([
-      hashPassword(password),
-      deriveRecoveryAnswerRecord(recoveryAnswer)
-    ]);
+    const passwordRecord = await hashPassword(password);
     const user = await withUsersMutationLock(async () => {
       const record = readUsersSync();
       if (record.users.some((item) => normalizeEmail(item.email) === email)) return null;
+      if (!filmDb.consumeRegistrationChallenge(email, filmDb.verificationCodeHmac(email, verificationCode))) return null;
       const createdUser = {
         id: userIdFromEmail(email),
         email,
         passwordSalt: passwordRecord.salt,
         passwordHash: passwordRecord.hash,
-        recovery: {
-          questionId: recoveryQuestion.id,
-          answerSalt: recoveryRecord.salt,
-          answerHash: recoveryRecord.hash,
-          updatedAt: new Date().toISOString()
-        },
+        role: "user",
+        status: "active",
+        emailVerified: true,
         createdAt: new Date().toISOString()
       };
       record.users.push(createdUser);
@@ -6218,7 +6593,7 @@ app.post("/api/auth/register", registrationRateLimit, async (req, res) => {
       return createdUser;
     });
     if (!user) {
-      res.status(409).json({ ok: false, error: "Email is already registered." });
+      res.status(400).json({ ok: false, code: "VERIFICATION_INVALID", error: "Email or verification code is invalid." });
       return;
     }
     await fsp.mkdir(path.join(userDataRoot, user.id), { recursive: true, mode: 0o700 });
@@ -6308,114 +6683,6 @@ app.post("/api/auth/password", requireAuth, passwordMutationRateLimit, async (re
     clearSessionCookie(req, res);
     await createUserSession(req, res, req.user.id);
     res.json({ ok: true, user: publicUser(req.user) });
-  } catch (error) {
-    sendAuthServiceError(res, error);
-  }
-});
-
-app.post("/api/auth/recovery/setup", requireAuth, passwordMutationRateLimit, async (req, res) => {
-  const currentPassword = String(req.body?.currentPassword || "");
-  const question = findRecoveryQuestion(req.body?.questionId);
-  const answer = normalizeRecoveryAnswer(req.body?.answer);
-  if (!question) {
-    res.status(400).json({ ok: false, error: "Select a supported recovery question." });
-    return;
-  }
-  if (answer.length < minimumRecoveryAnswerLength || answer.length > 200) {
-    res.status(400).json({ ok: false, error: `Recovery answer must be between ${minimumRecoveryAnswerLength} and 200 characters.` });
-    return;
-  }
-  try {
-    const answerRecord = await deriveRecoveryAnswerRecord(answer);
-    const updated = await withUsersMutationLock(async () => {
-      const record = readUsersSync();
-      const user = record.users.find((item) => item.id === req.user.id);
-      if (!user) throw new AuthStoreError("Authenticated user is missing from the authentication store.");
-      if (!(await verifyPassword(currentPassword, user))) return false;
-      user.recovery = {
-        questionId: question.id,
-        answerSalt: answerRecord.salt,
-        answerHash: answerRecord.hash,
-        updatedAt: new Date().toISOString()
-      };
-      await writeUsers(record);
-      return true;
-    });
-    if (!updated) {
-      res.status(401).json({ ok: false, error: "Current password is incorrect." });
-      return;
-    }
-    res.json({ ok: true, recoveryConfigured: true, questionId: question.id });
-  } catch (error) {
-    sendAuthServiceError(res, error);
-  }
-});
-
-app.post("/api/auth/recovery/challenge", recoveryIpRateLimit, recoveryAccountRateLimit, async (req, res) => {
-  const email = normalizeEmail(req.body?.email);
-  if (!email || email.length > 254) {
-    res.status(400).json({ ok: false, error: "Valid email is required." });
-    return;
-  }
-  try {
-    const record = readUsersSync();
-    const user = record.users.find((item) => normalizeEmail(item.email) === email && !item.disabled);
-    const configuredQuestion = findRecoveryQuestion(user?.recovery?.questionId);
-    const fallbackIndex = Number.parseInt(createHash("sha256").update(email).digest("hex").slice(0, 8), 16) % recoveryQuestions.length;
-    const question = configuredQuestion || recoveryQuestions[fallbackIndex];
-    res.json({
-      ok: true,
-      available: true,
-      questionId: question.id,
-      question: question.question
-    });
-  } catch (error) {
-    sendAuthServiceError(res, error);
-  }
-});
-
-app.post("/api/auth/recovery/reset", recoveryIpRateLimit, recoveryAccountRateLimit, async (req, res) => {
-  const email = normalizeEmail(req.body?.email);
-  const answer = normalizeRecoveryAnswer(req.body?.answer);
-  const nextPassword = String(req.body?.nextPassword || "");
-  const repeatPassword = String(req.body?.repeatPassword || "");
-  if (!email || email.length > 254 || answer.length < 3 || answer.length > 200) {
-    res.status(400).json({ ok: false, error: "Email and recovery answer are required." });
-    return;
-  }
-  if (nextPassword.length < minimumPasswordLength || nextPassword.length > 1024) {
-    res.status(400).json({ ok: false, error: `New password must be between ${minimumPasswordLength} and 1024 characters.` });
-    return;
-  }
-  if (nextPassword !== repeatPassword) {
-    res.status(400).json({ ok: false, error: "New passwords do not match." });
-    return;
-  }
-  try {
-    const passwordRecord = await hashPassword(nextPassword);
-    const reset = await withUsersMutationLock(async () => {
-      const record = readUsersSync();
-      const user = record.users.find((item) => normalizeEmail(item.email) === email && !item.disabled);
-      const question = findRecoveryQuestion(user?.recovery?.questionId);
-      if (!user || !question || !user.recovery?.answerHash || !user.recovery?.answerSalt) {
-        await deriveRecoveryAnswerRecord(answer, "00000000000000000000000000000000");
-        return false;
-      }
-      if (!(await verifyRecoveryAnswerRecord(answer, user.recovery))) return false;
-      user.passwordSalt = passwordRecord.salt;
-      user.passwordHash = passwordRecord.hash;
-      user.passwordUpdatedAt = new Date().toISOString();
-      user.recovery.lastUsedAt = user.passwordUpdatedAt;
-      record.sessions = record.sessions.filter((session) => session.userId !== user.id);
-      await writeUsers(record);
-      return true;
-    });
-    if (!reset) {
-      res.status(401).json({ ok: false, error: "Unable to verify the recovery answer." });
-      return;
-    }
-    clearSessionCookie(req, res);
-    res.json({ ok: true, passwordReset: true });
   } catch (error) {
     sendAuthServiceError(res, error);
   }
@@ -6540,10 +6807,10 @@ app.post("/api/film/projects", taskRateLimit, async (req, res) => {
     const project = await createProject({ title, prompt, ownerUserId: req.user.id });
     res.status(201).json({ ok: true, project });
   } catch (error) {
-    res.status(500).json({
+    res.status(error?.status || 500).json({
       ok: false,
       error: "Unable to create project.",
-      detail: error instanceof Error ? error.message : String(error)
+      code: error?.code || "PROJECT_CREATE_FAILED"
     });
   }
 });
@@ -6653,7 +6920,7 @@ app.get("/api/film/projects/:projectId/assets", async (req, res) => {
   }
 });
 
-app.post("/api/film/projects/:projectId/assets/actions", assetRateLimit, async (req, res) => {
+app.post("/api/film/projects/:projectId/assets/actions", assetRateLimit, requireAdmin, async (req, res) => {
   try {
     const projectId = String(req.params.projectId || "").trim();
     const action = String(req.body?.action || "regenerate").trim();
@@ -6702,6 +6969,8 @@ app.post("/api/film/projects/:projectId/assets/actions", assetRateLimit, async (
   }
 });
 
+app.use("/api/film/asset-jobs", requireAdmin);
+
 app.get("/api/film/asset-jobs/:jobId", async (req, res) => {
   const job = await loadAssetTaskJobForUser(req.user, String(req.params.jobId || "").trim());
   if (!job) {
@@ -6713,12 +6982,7 @@ app.get("/api/film/asset-jobs/:jobId", async (req, res) => {
 
 app.get("/api/film/asset-jobs", async (req, res) => {
   const projectId = String(req.query.project || "").trim();
-  const jobs = [...assetTaskJobs.values()]
-    .filter((job) => job.ownerUserId === req.user.id)
-    .filter((job) => !projectId || job.request?.projectId === projectId)
-    .sort((a, b) => String(b.updatedAt).localeCompare(String(a.updatedAt)))
-    .slice(0, 50)
-    .map(publicAssetTaskJob);
+  const jobs = filmDb.listJobs("asset", req.user.id, projectId, 50).map(publicAssetTaskJob);
   res.json({ ok: true, jobs });
 });
 
@@ -6783,7 +7047,18 @@ app.get("/api/film/agents/memory", async (_req, res) => {
 app.get("/api/film/runs", async (_req, res) => {
   try {
     const projectId = String(_req.query.project || "").trim();
-    res.json({ ok: true, runs: await getRecentRuns(20, projectId, _req.user) });
+    const limit = Math.min(50, Math.max(1, Number(_req.query.limit) || 20));
+    const offset = Math.max(0, Number(_req.query.offset) || 0);
+    const runs = await getRecentRuns(limit, projectId, _req.user, offset);
+    res.json({
+      ok: true,
+      runs,
+      page: {
+        limit,
+        offset,
+        nextOffset: runs.length === limit ? offset + runs.length : null
+      }
+    });
   } catch (error) {
     res.status(500).json({
       ok: false,
@@ -6795,7 +7070,16 @@ app.get("/api/film/runs", async (_req, res) => {
 
 app.get("/api/film/runs/:runId", async (req, res) => {
   try {
-    res.json({ ok: true, run: await getRunDetailForUser(String(req.params.runId || "").trim(), req.user) });
+    const run = await getRunDetailForUser(String(req.params.runId || "").trim(), req.user);
+    if (run?.status && typeof run.status === "object" && run.status.providerError) {
+      run.status = { ...run.status, providerError: "Model provider request failed." };
+    }
+    if (Array.isArray(run?.agentWork)) {
+      run.agentWork = run.agentWork.map((work) => work?.error
+        ? { ...work, error: "Agent execution failed.", rawText: undefined }
+        : { ...work, rawText: undefined });
+    }
+    res.json({ ok: true, run });
   } catch (error) {
     res.status(error?.status || 500).json({
       ok: false,
@@ -6881,6 +7165,10 @@ app.post("/api/film/task", taskRateLimit, async (req, res) => {
     res.status(400).json({ ok: false, error: "Prompt is required." });
     return;
   }
+  if (Buffer.byteLength(prompt, "utf8") > promptMaxBytes) {
+    res.status(413).json({ ok: false, code: "PROMPT_TOO_LARGE", error: "Prompt exceeds the 32KB limit." });
+    return;
+  }
   if (!requestedProjectId) {
     res.status(400).json({ ok: false, error: "projectId is required. Select or create a project before starting a run." });
     return;
@@ -6888,7 +7176,12 @@ app.post("/api/film/task", taskRateLimit, async (req, res) => {
 
   try {
     if (req.body?.background === true) {
-      res.status(202).json(await startFilmTaskJob({ prompt, requestedProjectId, account: req.user }));
+      res.status(202).json(await startFilmTaskJob({
+        prompt,
+        requestedProjectId,
+        account: req.user,
+        idempotencyKey: req.headers["idempotency-key"] || req.body?.idempotencyKey
+      }));
       return;
     }
     res.json(await processFilmTask({ prompt, requestedProjectId, account: req.user }));
@@ -6896,6 +7189,7 @@ app.post("/api/film/task", taskRateLimit, async (req, res) => {
     const failedTask = error?.filmTask || null;
     res.status(error?.status || 502).json({
       ok: false,
+      code: error?.code || "FILM_TASK_FAILED",
       error: "Film task failed.",
       detail: error instanceof Error ? error.message : String(error),
       projectId: failedTask?.projectId || requestedProjectId || null,
@@ -6922,6 +7216,10 @@ app.post("/api/film/runs/:runId/continue", taskRateLimit, async (req, res) => {
     res.status(400).json({ ok: false, error: "Prompt is required." });
     return;
   }
+  if (Buffer.byteLength(prompt, "utf8") > promptMaxBytes) {
+    res.status(413).json({ ok: false, code: "PROMPT_TOO_LARGE", error: "Prompt exceeds the 32KB limit." });
+    return;
+  }
   if (!requestedProjectId) {
     res.status(400).json({ ok: false, error: "projectId is required. Continue run must stay inside a selected project." });
     return;
@@ -6929,7 +7227,13 @@ app.post("/api/film/runs/:runId/continue", taskRateLimit, async (req, res) => {
 
   try {
     if (req.body?.background === true) {
-      res.status(202).json(await startFilmTaskJob({ prompt, requestedProjectId, parentRunId, account: req.user }));
+      res.status(202).json(await startFilmTaskJob({
+        prompt,
+        requestedProjectId,
+        parentRunId,
+        account: req.user,
+        idempotencyKey: req.headers["idempotency-key"] || req.body?.idempotencyKey
+      }));
       return;
     }
     res.json(await processFilmTask({ prompt, requestedProjectId, parentRunId, account: req.user }));
@@ -6937,6 +7241,7 @@ app.post("/api/film/runs/:runId/continue", taskRateLimit, async (req, res) => {
     const failedTask = error?.filmTask || null;
     res.status(error?.status || 502).json({
       ok: false,
+      code: error?.code || "FILM_TASK_FAILED",
       error: "Film continue task failed.",
       detail: error instanceof Error ? error.message : String(error),
       projectId: failedTask?.projectId || requestedProjectId || null,
@@ -6975,6 +7280,18 @@ if (!testMode) {
   });
 }
 
-app.listen(port, bindHost, () => {
+const httpServer = app.listen(port, bindHost, () => {
   console.log(`Film Studio listening on http://${bindHost}:${port}`);
 });
+
+for (const signal of ["SIGTERM", "SIGINT"]) {
+  process.once(signal, () => {
+    clearInterval(cleanupTimer);
+    httpServer.close(() => {
+      filmDb.close();
+      process.exit(0);
+    });
+    const forceTimer = setTimeout(() => process.exit(1), 10_000);
+    forceTimer.unref?.();
+  });
+}

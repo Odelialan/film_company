@@ -34,7 +34,7 @@ async function waitForServer(baseUrl, child, output) {
   throw new Error(`Test server did not become ready.\n${output()}`);
 }
 
-test("login creates a durable cookie session, logout revokes it, and corrupt auth storage returns 503", async () => {
+test("email verification registration, durable sessions, password rotation, and disabled recovery", async () => {
   const tempRoot = await mkdtemp(path.join(os.tmpdir(), "film-auth-test-"));
   const storePath = path.join(tempRoot, "users.json");
   const userDataPath = path.join(tempRoot, "user-data");
@@ -66,6 +66,13 @@ test("login creates a durable cookie session, logout revokes it, and corrupt aut
       FILM_USER_DATA_ROOT: userDataPath,
       FILM_TEST_MODE: "1",
       FILM_ALLOW_REGISTRATION: "1",
+      FILM_TURNSTILE_SITE_KEY: "test-site-key",
+      FILM_TURNSTILE_SECRET_KEY: "test-secret-key",
+      FILM_TURNSTILE_HOSTNAME: "127.0.0.1",
+      FILM_TURNSTILE_ACTION: "register",
+      FILM_SMTP_JSON_TRANSPORT: "1",
+      FILM_SMTP_FROM: "no-reply@example.test",
+      FILM_TEST_REGISTRATION_CODE: "12345678",
       OPENAI_API_KEY: "server-global-test-key",
       NODE_ENV: "test"
     },
@@ -76,48 +83,55 @@ test("login creates a durable cookie session, logout revokes it, and corrupt aut
 
   try {
     await waitForServer(baseUrl, child, () => logs);
+    const registrationConfig = await fetch(`${baseUrl}/api/auth/registration/config`);
+    assert.deepEqual(await registrationConfig.json(), {
+      ok: true,
+      registrationEnabled: true,
+      turnstileSiteKey: "test-site-key"
+    });
+    const registeredEmail = "new-account@example.test";
+    const registeredPassword = "abc123-secure";
+    const registrationStart = await fetch(`${baseUrl}/api/auth/registration/start`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ email: registeredEmail, turnstileToken: "test-valid-turnstile" })
+    });
+    assert.equal(registrationStart.status, 202, await registrationStart.text());
     const shortRegistration = await fetch(`${baseUrl}/api/auth/register`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         email: "short-password@example.test",
+        verificationCode: "12345678",
         password: "abc12",
-        repeatPassword: "abc12",
-        questionId: "first_creation",
-        recoveryAnswer: "test answer"
+        repeatPassword: "abc12"
       })
     });
     assert.equal(shortRegistration.status, 400);
-    const registeredEmail = "new-account@example.test";
-    const registeredPassword = "abc123-secure";
     const registration = await fetch(`${baseUrl}/api/auth/register`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         email: registeredEmail,
+        verificationCode: "12345678",
         password: registeredPassword,
-        repeatPassword: registeredPassword,
-        questionId: "first_creation",
-        recoveryAnswer: "my first little film"
+        repeatPassword: registeredPassword
       })
     });
     assert.equal(registration.status, 201, await registration.text());
-    const registeredChallenge = await fetch(`${baseUrl}/api/auth/recovery/challenge`, {
+    const replayedTurnstile = await fetch(`${baseUrl}/api/auth/registration/start`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ email: "another@example.test", turnstileToken: "test-valid-turnstile" })
+    });
+    assert.notEqual(replayedTurnstile.status, 202);
+    const recoveryDisabled = await fetch(`${baseUrl}/api/auth/recovery/challenge`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ email: registeredEmail })
     });
-    assert.equal(registeredChallenge.status, 200);
-    assert.equal((await registeredChallenge.json()).questionId, "first_creation");
-    const missingChallenge = await fetch(`${baseUrl}/api/auth/recovery/challenge`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ email: "not-registered@example.test" })
-    });
-    const missingChallengePayload = await missingChallenge.json();
-    assert.equal(missingChallenge.status, 200);
-    assert.equal(missingChallengePayload.available, true);
-    assert.equal(typeof missingChallengePayload.question, "string");
+    assert.equal(recoveryDisabled.status, 410);
+    assert.equal((await recoveryDisabled.json()).code, "RECOVERY_DISABLED");
 
     const login = await fetch(`${baseUrl}/api/auth/login`, {
       method: "POST",
@@ -133,16 +147,11 @@ test("login creates a durable cookie session, logout revokes it, and corrupt aut
 
     const me = await fetch(`${baseUrl}/api/auth/me`, { headers: { Cookie: cookie } });
     assert.equal(me.status, 200);
-    assert.equal((await me.json()).user.email, email);
-    await access(path.join(userDataPath, "_auth", "users.backup.json"));
-
-    const corruptModelConfigPath = path.join(userDataPath, "user-auth-smoke", "model-config.json");
-    await mkdir(path.dirname(corruptModelConfigPath), { recursive: true });
-    await writeFile(corruptModelConfigPath, "{broken", { mode: 0o600 });
-    const corruptModelConfig = await fetch(`${baseUrl}/api/config/models`, { headers: { Cookie: cookie } });
-    assert.equal(corruptModelConfig.status, 503);
-    assert.equal((await corruptModelConfig.json()).code, "MODEL_CONFIG_INVALID");
-    await rm(corruptModelConfigPath, { force: true });
+    const mePayload = await me.json();
+    assert.equal(mePayload.user.email, email);
+    assert.equal(mePayload.user.role, "admin");
+    assert.equal(mePayload.user.emailVerified, true);
+    await access(path.join(userDataPath, "film-studio.sqlite"));
 
     const shortPasswordChange = await fetch(`${baseUrl}/api/auth/password`, {
       method: "POST",
@@ -164,56 +173,11 @@ test("login creates a durable cookie session, logout revokes it, and corrupt aut
     const rotatedSession = await fetch(`${baseUrl}/api/auth/me`, { headers: { Cookie: rotatedCookie } });
     assert.equal(rotatedSession.status, 200);
 
-    const recoveryAnswer = "blue dolphin recovery phrase";
-    const recoverySetup = await fetch(`${baseUrl}/api/auth/recovery/setup`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json", Cookie: rotatedCookie },
-      body: JSON.stringify({ currentPassword: nextPassword, questionId: "recovery_phrase", answer: recoveryAnswer })
-    });
-    assert.equal(recoverySetup.status, 200, await recoverySetup.text());
-    const challenge = await fetch(`${baseUrl}/api/auth/recovery/challenge`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ email })
-    });
-    const challengePayload = await challenge.json();
-    assert.equal(challenge.status, 200);
-    assert.equal(challengePayload.available, true);
-    assert.equal(challengePayload.questionId, "recovery_phrase");
-
-    const recoveryPassword = "ghi789-secure";
-    const wrongRecovery = await fetch(`${baseUrl}/api/auth/recovery/reset`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ email, answer: "wrong recovery answer", nextPassword: recoveryPassword, repeatPassword: recoveryPassword })
-    });
-    assert.equal(wrongRecovery.status, 401);
-    const recoveryReset = await fetch(`${baseUrl}/api/auth/recovery/reset`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ email, answer: recoveryAnswer, nextPassword: recoveryPassword, repeatPassword: recoveryPassword })
-    });
-    assert.equal(recoveryReset.status, 200, await recoveryReset.text());
-    const revokedByRecovery = await fetch(`${baseUrl}/api/auth/me`, { headers: { Cookie: rotatedCookie } });
-    assert.equal(revokedByRecovery.status, 401);
-
-    const recoveredLogin = await fetch(`${baseUrl}/api/auth/login`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ email, password: recoveryPassword })
-    });
-    assert.equal(recoveredLogin.status, 200, await recoveredLogin.text());
-    const recoveredCookie = (recoveredLogin.headers.get("set-cookie") || "").split(";", 1)[0];
-    const logout = await fetch(`${baseUrl}/api/auth/logout`, { method: "POST", headers: { Cookie: recoveredCookie } });
+    const logout = await fetch(`${baseUrl}/api/auth/logout`, { method: "POST", headers: { Cookie: rotatedCookie } });
     assert.equal(logout.status, 200);
     assert.match(logout.headers.get("set-cookie") || "", /Max-Age=0/i);
-    const afterLogout = await fetch(`${baseUrl}/api/auth/me`, { headers: { Cookie: recoveredCookie } });
+    const afterLogout = await fetch(`${baseUrl}/api/auth/me`, { headers: { Cookie: rotatedCookie } });
     assert.equal(afterLogout.status, 401);
-
-    await writeFile(storePath, "{broken", { mode: 0o600 });
-    const unavailable = await fetch(`${baseUrl}/api/auth/me`, { headers: { Cookie: recoveredCookie } });
-    assert.equal(unavailable.status, 503);
-    assert.equal((await unavailable.json()).code, "AUTH_STORE_UNAVAILABLE");
   } finally {
     child.kill("SIGTERM");
     if (child.exitCode === null) await once(child, "exit").catch(() => {});

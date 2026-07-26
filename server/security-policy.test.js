@@ -10,7 +10,9 @@ import {
 
 test("trusted model URLs reject dangerous URL forms", () => {
   assert.equal(normalizeTrustedModelBaseUrl("https://api.example.com/v1/"), "https://api.example.com/v1");
+  assert.equal(normalizeTrustedModelBaseUrl("http://127.0.0.1:11434/v1"), "http://127.0.0.1:11434/v1");
   for (const value of [
+    "http://api.example.com/v1",
     "file:///etc/passwd",
     "https://user:pass@example.com/v1",
     "https://example.com/v1?target=internal",

@@ -1,6 +1,6 @@
 ﻿import type { CSSProperties } from "react";
-import { useEffect, useMemo, useState } from "react";
-import { ArrowRight, CheckCircle2, CircleDot, Command, FileCheck2, Folder, Image as ImageIcon, KeyRound, Loader2, MessageSquareText, Play, Plus, Radio, RefreshCw, Search, Send, Server, SlidersHorizontal, Video, X } from "lucide-react";
+import { useEffect, useMemo, useRef, useState } from "react";
+import { ArrowRight, CheckCircle2, CircleDot, Command, FileCheck2, Folder, Image as ImageIcon, KeyRound, Loader2, MessageSquareText, Play, Plus, Radio, RefreshCw, Send, Server, SlidersHorizontal, Video, X } from "lucide-react";
 import { agents, assets, documents, loopSteps, nav, quickActions, stages } from "./data/studio";
 
 const statusText = {
@@ -109,6 +109,16 @@ const promptIdeas = Array.from({ length: 50 }, (_, index) => buildPromptIdea(ind
 const defaultPrompt = promptIdeas[0];
 const apiBaseUrl = import.meta.env.VITE_API_BASE_URL || "";
 const workbenchStorageKey = "film-studio:last-workbench";
+
+declare global {
+  interface Window {
+    turnstile?: {
+      render: (container: HTMLElement, options: Record<string, unknown>) => string;
+      remove: (widgetId: string) => void;
+      reset: (widgetId: string) => void;
+    };
+  }
+}
 
 type RuntimeAgent = {
   id: string;
@@ -261,15 +271,24 @@ type UserAccount = {
   id: string;
   email: string;
   createdAt?: string | null;
-  recoveryConfigured?: boolean;
+  role: "user" | "admin";
+  status: "active" | "disabled" | "disabled_pending_review";
+  emailVerified: boolean;
 };
 
-type AuthMode = "login" | "register" | "recover";
-
-type RecoveryQuestion = {
-  id: string;
-  question: string;
+type UsageState = {
+  projectCount: number;
+  projectLimit: number;
+  storageBytes: number;
+  storageReservedBytes: number;
+  storageLimitBytes: number;
+  dailyFilmRuns: { used: number; reserved: number };
+  dailyFilmRunLimit: number;
+  dailyAssets: { used: number; reserved: number };
+  dailyAssetLimit: number;
 };
+
+type AuthMode = "login" | "register";
 
 type ModelConnectionEntry = {
   key: string;
@@ -430,7 +449,12 @@ export function App() {
   const [modelListDraft, setModelListDraft] = useState<string[]>([""]);
   const [authChecked, setAuthChecked] = useState(false);
   const [registrationEnabled, setRegistrationEnabled] = useState(false);
+  const [turnstileSiteKey, setTurnstileSiteKey] = useState("");
+  const [turnstileToken, setTurnstileToken] = useState("");
+  const [registrationCodeSent, setRegistrationCodeSent] = useState(false);
+  const [verificationCode, setVerificationCode] = useState("");
   const [authUser, setAuthUser] = useState<UserAccount | null>(null);
+  const [usage, setUsage] = useState<UsageState | null>(null);
   const [authMode, setAuthMode] = useState<AuthMode>("login");
   const [authEmail, setAuthEmail] = useState("");
   const [authPassword, setAuthPassword] = useState("");
@@ -439,13 +463,10 @@ export function App() {
   const [currentPassword, setCurrentPassword] = useState("");
   const [nextPassword, setNextPassword] = useState("");
   const [nextPasswordRepeat, setNextPasswordRepeat] = useState("");
-  const [recoveryQuestions, setRecoveryQuestions] = useState<RecoveryQuestion[]>([]);
-  const [recoveryQuestionId, setRecoveryQuestionId] = useState("recovery_phrase");
-  const [recoveryAnswer, setRecoveryAnswer] = useState("");
-  const [recoveryCurrentPassword, setRecoveryCurrentPassword] = useState("");
-  const [recoveryChallenge, setRecoveryChallenge] = useState<{ questionId: string; question: string } | null>(null);
-  const [recoveryNextPassword, setRecoveryNextPassword] = useState("");
-  const [recoveryNextPasswordRepeat, setRecoveryNextPasswordRepeat] = useState("");
+  const turnstileContainerRef = useRef<HTMLDivElement | null>(null);
+  const turnstileWidgetIdRef = useRef<string | null>(null);
+  const passwordDialogRef = useRef<HTMLDialogElement | null>(null);
+  const securityButtonRef = useRef<HTMLButtonElement | null>(null);
   const [activeAssetJobId, setActiveAssetJobId] = useState("");
   const [selectedApprovalEntryIds, setSelectedApprovalEntryIds] = useState<string[]>([]);
   const [task, setTask] = useState<TaskState>({
@@ -548,24 +569,21 @@ export function App() {
     return nextConfig;
   }
 
-  async function loadRecoveryQuestions() {
-    const response = await apiFetch("/api/auth/recovery/questions");
+  async function reloadUsage() {
+    const response = await apiFetch("/api/usage");
     const payload = await response.json().catch(() => ({}));
-    if (!response.ok || !Array.isArray(payload?.questions)) {
-      throw new Error(payload?.error || `HTTP ${response.status}`);
-    }
-    setRecoveryQuestions(payload.questions);
-    if (!payload.questions.some((item: RecoveryQuestion) => item.id === recoveryQuestionId) && payload.questions[0]?.id) {
-      setRecoveryQuestionId(payload.questions[0].id);
-    }
-    return payload.questions as RecoveryQuestion[];
+    if (!response.ok || !payload?.usage) throw new Error(payload?.error || `HTTP ${response.status}`);
+    setUsage(payload.usage as UsageState);
   }
 
-  async function openPasswordPanel() {
+  function openPasswordPanel() {
     setPasswordPanelOpen(true);
-    await loadRecoveryQuestions().catch((error) => {
-      setTask({ status: "error", message: "无法读取验证问题。", meta: error instanceof Error ? error.message : String(error) });
-    });
+    void reloadUsage().catch(() => setUsage(null));
+  }
+
+  function closePasswordPanel() {
+    setPasswordPanelOpen(false);
+    window.setTimeout(() => securityButtonRef.current?.focus(), 0);
   }
 
   function openModelSettings(profile = activeModelProfile) {
@@ -705,10 +723,11 @@ export function App() {
         const authResponse = await apiFetch("/api/auth/me");
         const authPayload = await authResponse.json().catch(() => ({}));
         if (!authResponse.ok || !authPayload?.user) {
-          const healthResponse = await apiFetch("/api/health").catch(() => null);
-          const healthPayload = healthResponse ? await healthResponse.json().catch(() => ({})) : {};
+          const registrationResponse = await apiFetch("/api/auth/registration/config").catch(() => null);
+          const registrationPayload = registrationResponse ? await registrationResponse.json().catch(() => ({})) : {};
           if (!cancelled) {
-            setRegistrationEnabled(Boolean(healthPayload?.registrationEnabled));
+            setRegistrationEnabled(Boolean(registrationPayload?.registrationEnabled));
+            setTurnstileSiteKey(String(registrationPayload?.turnstileSiteKey || ""));
             setAuthChecked(true);
             setTask({ status: "idle", message: "请先登录 Film Studio。", meta: "用户数据会按账户隔离保存" });
           }
@@ -757,6 +776,47 @@ export function App() {
   }, []);
 
   useEffect(() => {
+    if (authMode !== "register" || registrationCodeSent || !turnstileSiteKey || !turnstileContainerRef.current) return;
+    let cancelled = false;
+    const renderWidget = () => {
+      if (cancelled || !window.turnstile || !turnstileContainerRef.current || turnstileWidgetIdRef.current) return;
+      turnstileWidgetIdRef.current = window.turnstile.render(turnstileContainerRef.current, {
+        sitekey: turnstileSiteKey,
+        action: "register",
+        callback: (token: string) => setTurnstileToken(token),
+        "expired-callback": () => setTurnstileToken(""),
+        "error-callback": () => setTurnstileToken("")
+      });
+    };
+    let script = document.querySelector<HTMLScriptElement>("script[data-film-turnstile]");
+    if (!script) {
+      script = document.createElement("script");
+      script.src = "https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit";
+      script.async = true;
+      script.defer = true;
+      script.dataset.filmTurnstile = "true";
+      document.head.appendChild(script);
+    }
+    if (window.turnstile) renderWidget();
+    else script.addEventListener("load", renderWidget, { once: true });
+    return () => {
+      cancelled = true;
+      if (turnstileWidgetIdRef.current && window.turnstile) {
+        window.turnstile.remove(turnstileWidgetIdRef.current);
+        turnstileWidgetIdRef.current = null;
+      }
+      setTurnstileToken("");
+    };
+  }, [authMode, registrationCodeSent, turnstileSiteKey]);
+
+  useEffect(() => {
+    const dialog = passwordDialogRef.current;
+    if (!dialog) return;
+    if (passwordPanelOpen && !dialog.open) dialog.showModal();
+    if (!passwordPanelOpen && dialog.open) dialog.close();
+  }, [passwordPanelOpen]);
+
+  useEffect(() => {
     if (authUser?.id) saveWorkbench(workbench, authUser.id);
   }, [workbench, authUser?.id]);
 
@@ -780,22 +840,42 @@ export function App() {
   }, []);
 
   async function submitAuth() {
-    if (authMode === "recover") return;
     if (authMode === "register" && !registrationEnabled) {
       setTask({ status: "error", message: "公开注册已关闭，请联系管理员开通账户。" });
       return;
     }
     const normalizedEmail = authEmail.trim().toLowerCase();
-    if (!normalizedEmail || !authPassword) {
+    if (!normalizedEmail || (authMode === "login" && !authPassword)) {
       setTask({ status: "error", message: "请输入邮箱和密码。" });
+      return;
+    }
+    if (authMode === "register" && !registrationCodeSent) {
+      if (!turnstileToken) {
+        setTask({ status: "error", message: "请先完成人机验证。" });
+        return;
+      }
+      try {
+        setTask({ status: "submitting", message: "正在发送邮箱验证码..." });
+        const response = await apiFetch("/api/auth/registration/start", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ email: normalizedEmail, turnstileToken })
+        });
+        const payload = await response.json().catch(() => ({}));
+        if (!response.ok) throw new Error(payload?.error || `HTTP ${response.status}`);
+        setRegistrationCodeSent(true);
+        setTask({ status: "success", message: "若该邮箱可注册，8 位验证码已发送。验证码 10 分钟内有效。" });
+      } catch (error) {
+        setTask({ status: "error", message: "无法发送验证码。", meta: error instanceof Error ? error.message : String(error) });
+      }
       return;
     }
     if (authMode === "register" && authPassword.length < 12) {
       setTask({ status: "error", message: "新账户密码至少需要 12 个字符。" });
       return;
     }
-    if (authMode === "register" && (!recoveryQuestionId || recoveryAnswer.trim().length < 8)) {
-      setTask({ status: "error", message: "请选择验证问题并填写至少 8 个字符的答案。" });
+    if (authMode === "register" && (!/^\d{8}$/.test(verificationCode) || authPassword !== authPasswordRepeat)) {
+      setTask({ status: "error", message: "请输入 8 位验证码，并确认两次密码一致。" });
       return;
     }
     const endpoint = authMode === "register" ? "/api/auth/register" : "/api/auth/login";
@@ -808,8 +888,7 @@ export function App() {
           email: normalizedEmail,
           password: authPassword,
           repeatPassword: authPasswordRepeat,
-          questionId: recoveryQuestionId,
-          recoveryAnswer
+          verificationCode
         })
       });
       const payload = await response.json().catch(() => ({}));
@@ -827,7 +906,8 @@ export function App() {
       setAuthUser(user);
       setAuthPassword("");
       setAuthPasswordRepeat("");
-      setRecoveryAnswer("");
+      setVerificationCode("");
+      setRegistrationCodeSent(false);
       setAuthChecked(true);
       if (saved) {
         setWorkbench(saved);
@@ -855,6 +935,7 @@ export function App() {
     await apiFetch("/api/auth/logout", { method: "POST" }).catch(() => null);
     if (authUser?.id) window.localStorage.removeItem(userWorkbenchStorageKey(authUser.id));
     setAuthUser(null);
+    setUsage(null);
     setRuntime(null);
     setModelConfig(null);
     setWorkbench(createDraftWorkbench(defaultPrompt));
@@ -864,86 +945,6 @@ export function App() {
     setAuthPasswordRepeat("");
     setView("home");
     setTask({ status: "idle", message: "已退出登录。" });
-  }
-
-  async function requestRecoveryChallenge() {
-    const email = authEmail.trim().toLowerCase();
-    if (!email) {
-      setTask({ status: "error", message: "请输入需要恢复的账户邮箱。" });
-      return;
-    }
-    setTask({ status: "submitting", message: "正在读取账户验证问题..." });
-    try {
-      const response = await apiFetch("/api/auth/recovery/challenge", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ email })
-      });
-      const payload = await response.json().catch(() => ({}));
-      if (!response.ok) throw new Error(payload?.error || `HTTP ${response.status}`);
-      if (!payload?.available || !payload?.question) {
-        setRecoveryChallenge(null);
-        setTask({ status: "error", message: "该账户尚未设置验证问题，无法自助重置密码。" });
-        return;
-      }
-      setRecoveryChallenge({ questionId: payload.questionId, question: payload.question });
-      setTask({ status: "idle", message: "请回答验证问题并设置新密码。" });
-    } catch (error) {
-      setTask({ status: "error", message: "无法读取验证问题。", meta: error instanceof Error ? error.message : String(error) });
-    }
-  }
-
-  async function resetForgottenPassword() {
-    if (!recoveryChallenge || recoveryAnswer.trim().length < 3 || recoveryNextPassword.length < 12 || recoveryNextPassword !== recoveryNextPasswordRepeat) {
-      setTask({ status: "error", message: "请填写验证答案；新密码至少 12 个字符且两次输入必须一致。" });
-      return;
-    }
-    setTask({ status: "submitting", message: "正在验证答案并重设密码..." });
-    try {
-      const response = await apiFetch("/api/auth/recovery/reset", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          email: authEmail.trim().toLowerCase(),
-          answer: recoveryAnswer,
-          nextPassword: recoveryNextPassword,
-          repeatPassword: recoveryNextPasswordRepeat
-        })
-      });
-      const payload = await response.json().catch(() => ({}));
-      if (!response.ok) throw new Error(payload?.error || `HTTP ${response.status}`);
-      setRecoveryChallenge(null);
-      setRecoveryAnswer("");
-      setRecoveryNextPassword("");
-      setRecoveryNextPasswordRepeat("");
-      setAuthMode("login");
-      setTask({ status: "success", message: "密码已重设，所有旧登录会话均已撤销。请使用新密码登录。" });
-    } catch (error) {
-      setTask({ status: "error", message: "密码重设失败。", meta: error instanceof Error ? error.message : String(error) });
-    }
-  }
-
-  async function setupRecoveryQuestion() {
-    if (!recoveryCurrentPassword || recoveryAnswer.trim().length < 8 || !recoveryQuestionId) {
-      setTask({ status: "error", message: "请选择验证问题，并填写当前密码和至少 8 个字符的答案。" });
-      return;
-    }
-    setTask({ status: "submitting", message: "正在保存验证问题..." });
-    try {
-      const response = await apiFetch("/api/auth/recovery/setup", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ currentPassword: recoveryCurrentPassword, questionId: recoveryQuestionId, answer: recoveryAnswer })
-      });
-      const payload = await response.json().catch(() => ({}));
-      if (!response.ok) throw new Error(payload?.error || `HTTP ${response.status}`);
-      setRecoveryCurrentPassword("");
-      setRecoveryAnswer("");
-      setAuthUser((current) => current ? { ...current, recoveryConfigured: true } : current);
-      setTask({ status: "success", message: "验证问题已保存。", meta: "答案仅以不可逆哈希保存" });
-    } catch (error) {
-      setTask({ status: "error", message: "验证问题保存失败。", meta: error instanceof Error ? error.message : String(error) });
-    }
   }
 
   async function changePassword() {
@@ -966,7 +967,7 @@ export function App() {
       setCurrentPassword("");
       setNextPassword("");
       setNextPasswordRepeat("");
-      setPasswordPanelOpen(false);
+      closePasswordPanel();
       setTask({ status: "success", message: "密码已更新，其他登录会话已撤销。", meta: "当前设备已重新签发会话" });
     } catch (error) {
       setTask({ status: "error", message: "密码修改失败。", meta: error instanceof Error ? error.message : String(error) });
@@ -976,38 +977,45 @@ export function App() {
   function renderPasswordPanel() {
     if (!passwordPanelOpen) return null;
     return (
-      <div className="password-overlay" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) setPasswordPanelOpen(false); }}>
-        <div className="password-panel">
+      <dialog
+        ref={passwordDialogRef}
+        className="password-overlay"
+        aria-labelledby="security-dialog-title"
+        onCancel={(event) => { event.preventDefault(); closePasswordPanel(); }}
+        onMouseDown={(event) => { if (event.target === event.currentTarget) closePasswordPanel(); }}
+      >
+        <div className="password-panel" role="document">
           <div className="password-panel-head">
             <div>
               <p className="eyebrow">Account Security</p>
-              <h2>账户安全</h2>
+              <h2 id="security-dialog-title">账户安全</h2>
             </div>
-            <button className="icon-button" type="button" aria-label="关闭" onClick={() => setPasswordPanelOpen(false)}><X size={17} /></button>
+            <button className="icon-button" type="button" aria-label="关闭" onClick={closePasswordPanel}><X size={17} /></button>
           </div>
+          <section className="security-section usage-section" aria-label="账户用量">
+            <h3>账户用量</h3>
+            {usage ? (
+              <div className="usage-grid">
+                <span>项目 <strong>{usage.projectCount} / {usage.projectLimit}</strong></span>
+                <span>存储 <strong>{formatBytes(usage.storageBytes + usage.storageReservedBytes)} / {formatBytes(usage.storageLimitBytes)}</strong></span>
+                <span>今日 Film Run <strong>{usage.dailyFilmRuns.used + usage.dailyFilmRuns.reserved} / {usage.dailyFilmRunLimit}</strong></span>
+                {authUser?.role === "admin" ? (
+                  <span>今日 Dreamina <strong>{usage.dailyAssets.used + usage.dailyAssets.reserved} / {usage.dailyAssetLimit}</strong></span>
+                ) : null}
+              </div>
+            ) : <p className="muted">正在读取用量…</p>}
+          </section>
           <form className="security-section" onSubmit={(event) => { event.preventDefault(); void changePassword(); }}>
             <h3>修改登录密码</h3>
-            <label><span>当前密码</span><input type="password" autoComplete="current-password" value={currentPassword} onChange={(event) => setCurrentPassword(event.target.value)} required /></label>
+            <label><span>当前密码</span><input autoFocus type="password" autoComplete="current-password" value={currentPassword} onChange={(event) => setCurrentPassword(event.target.value)} required /></label>
             <label><span>新密码</span><input type="password" autoComplete="new-password" value={nextPassword} onChange={(event) => setNextPassword(event.target.value)} required minLength={12} maxLength={1024} /></label>
             <label><span>重复新密码</span><input type="password" autoComplete="new-password" value={nextPasswordRepeat} onChange={(event) => setNextPasswordRepeat(event.target.value)} required minLength={12} maxLength={1024} /></label>
             <p className="muted">成功后会撤销其他设备的全部登录会话，当前设备自动重新登录。</p>
             <button className="primary-action" type="submit" disabled={task.status === "submitting"}>{task.status === "submitting" ? "更新中..." : "更新密码"}</button>
           </form>
-          <form className="security-section" onSubmit={(event) => { event.preventDefault(); void setupRecoveryQuestion(); }}>
-            <h3>忘记密码验证问题</h3>
-            <p className="muted">状态：{authUser?.recoveryConfigured ? "已设置，可重新设置" : "尚未设置"}。答案仅保存不可逆哈希。</p>
-            <label>
-              <span>验证问题</span>
-              <select value={recoveryQuestionId} onChange={(event) => setRecoveryQuestionId(event.target.value)} required>
-                {recoveryQuestions.map((item) => <option value={item.id} key={item.id}>{item.question}</option>)}
-              </select>
-            </label>
-            <label><span>验证答案</span><input type="text" autoComplete="off" value={recoveryAnswer} onChange={(event) => setRecoveryAnswer(event.target.value)} required minLength={8} maxLength={200} /></label>
-            <label><span>当前登录密码</span><input type="password" autoComplete="current-password" value={recoveryCurrentPassword} onChange={(event) => setRecoveryCurrentPassword(event.target.value)} required /></label>
-            <button className="ghost-button" type="submit" disabled={task.status === "submitting"}>{authUser?.recoveryConfigured ? "重新设置验证问题" : "保存验证问题"}</button>
-          </form>
+          <p className="muted">远程安全问题恢复已禁用。遗失密码时请联系本机管理员通过 CLI 重设。</p>
         </div>
-      </div>
+      </dialog>
     );
   }
 
@@ -1040,19 +1048,17 @@ export function App() {
         .sort((a: RuntimeRun, b: RuntimeRun) => String(a.createdAt || a.updatedAt || "").localeCompare(String(b.createdAt || b.updatedAt || "")));
 
       if (projectRuns.length > 0) {
-        // Load full details for all runs to build conversation history
-        const runDetails = (await Promise.all(projectRuns.slice(-40).map(async (run: RuntimeRun) => {
-          try {
-            const response = await apiFetch(`/api/film/runs/${encodeURIComponent(run.id)}`);
-            const detailPayload = await response.json().catch(() => ({}));
-            return response.ok && detailPayload?.run ? detailPayload.run : run;
-          } catch {
-            return run;
-          }
-        }))).filter(Boolean);
-
-        const messages = messagesFromConversationDetails(runDetails);
         const latestRun = projectRuns[projectRuns.length - 1];
+        let latestRunDetail = latestRun;
+        try {
+          const response = await apiFetch(`/api/film/runs/${encodeURIComponent(latestRun.id)}`);
+          const detailPayload = await response.json().catch(() => ({}));
+          if (response.ok && detailPayload?.run) latestRunDetail = detailPayload.run;
+        } catch {
+          // The summary still provides a usable history row if detail loading fails.
+        }
+        const runDetails = projectRuns.map((run) => run.id === latestRun.id ? latestRunDetail : run);
+        const messages = messagesFromConversationDetails(runDetails);
         const next = loadedProgress?.nextStage;
         const statusBody = next
           ? `当前执行到阶段 ${next.order}「${next.name}」。缺少：${next.missingDeliverables?.length ? next.missingDeliverables.join("、") : "待细化交付物"}。输入\u201c继续\u201d后，总导演会按这个阶段继续派发给 ${next.owner}。`
@@ -1191,12 +1197,13 @@ export function App() {
     setPrompt(conversation.latestPrompt || latestRun.prompt || prompt);
     setView("workspace");
     try {
-      const runDetails = (await Promise.all(sortedRuns.slice(-40).map(async (run) => {
-        const response = await apiFetch(`/api/film/runs/${encodeURIComponent(run.id)}`);
-        const payload = await response.json().catch(() => ({}));
-        return response.ok && payload?.run ? payload.run : run;
-      }))).filter(Boolean);
-      const loaded = createWorkbenchFromConversation(conversation, runDetails);
+      const response = await apiFetch(`/api/film/runs/${encodeURIComponent(latestRun.id)}`);
+      const payload = await response.json().catch(() => ({}));
+      const latestDetail = response.ok && payload?.run ? payload.run : latestRun;
+      const loaded = createWorkbenchFromConversation(conversation, [
+        ...sortedRuns.slice(0, -1),
+        latestDetail
+      ]);
       setWorkbench(loaded);
       setPrompt(loaded.prompt || prompt);
       if (loaded.projectId) {
@@ -1318,11 +1325,12 @@ export function App() {
     setView("workspace");
 
     const requestStartedAt = new Date();
+    const idempotencyKey = `film-${crypto.randomUUID()}`;
     try {
       const response = await apiFetch(endpoint, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ prompt: nextPrompt, projectId, background: true })
+        headers: { "Content-Type": "application/json", "Idempotency-Key": idempotencyKey },
+        body: JSON.stringify({ prompt: nextPrompt, projectId, background: true, idempotencyKey })
       });
       let payload = await response.json().catch(() => ({}));
 
@@ -1536,57 +1544,34 @@ export function App() {
         <section className="auth-panel">
           <div>
             <p className="eyebrow">Film Studio</p>
-            <h1>{authMode === "recover" ? "重设密码" : "账户登录"}</h1>
-            <p>{authMode === "recover" ? "通过预先设置的验证问题重设密码。" : "模型接口、API key 和历史对话按账户保存。"}</p>
+            <h1>{authMode === "register" ? "创建账户" : "账户登录"}</h1>
+            <p>模型接口、API key 和历史对话按账户隔离保存。</p>
           </div>
-          {authMode === "recover" ? (
-            <button className="auth-back" type="button" onClick={() => { setAuthMode("login"); setRecoveryChallenge(null); }}>返回登录</button>
-          ) : (
-            <div className="auth-tabs">
-              <button className={authMode === "login" ? "active" : ""} onClick={() => setAuthMode("login")} type="button">登录</button>
-              {registrationEnabled && <button className={authMode === "register" ? "active" : ""} onClick={() => { setAuthMode("register"); void loadRecoveryQuestions(); }} type="button">注册</button>}
-            </div>
-          )}
-          {authMode === "recover" ? (
-            <form className="auth-form" onSubmit={(event) => { event.preventDefault(); void (recoveryChallenge ? resetForgottenPassword() : requestRecoveryChallenge()); }}>
-              <label>
-                <span>账户邮箱</span>
-                <input value={authEmail} onChange={(event) => { setAuthEmail(event.target.value); setRecoveryChallenge(null); }} type="email" autoComplete="email" required maxLength={254} disabled={Boolean(recoveryChallenge)} />
-              </label>
-              {recoveryChallenge ? (
+          <div className="auth-tabs">
+            <button className={authMode === "login" ? "active" : ""} onClick={() => { setAuthMode("login"); setRegistrationCodeSent(false); }} type="button">登录</button>
+            {registrationEnabled && <button className={authMode === "register" ? "active" : ""} onClick={() => { setAuthMode("register"); setRegistrationCodeSent(false); }} type="button">注册</button>}
+          </div>
+          <form className="auth-form" onSubmit={(event) => { event.preventDefault(); void submitAuth(); }}>
+              <label><span>邮箱</span><input value={authEmail} onChange={(event) => { setAuthEmail(event.target.value); setRegistrationCodeSent(false); }} type="email" autoComplete="email" required maxLength={254} disabled={authMode === "register" && registrationCodeSent} /></label>
+              {authMode === "register" && !registrationCodeSent && <div ref={turnstileContainerRef} className="turnstile-slot" aria-label="人机验证" />}
+              {authMode === "register" && registrationCodeSent && (
+                <label><span>8 位邮箱验证码</span><input value={verificationCode} onChange={(event) => setVerificationCode(event.target.value.replace(/\D/g, "").slice(0, 8))} inputMode="numeric" autoComplete="one-time-code" required minLength={8} maxLength={8} /></label>
+              )}
+              {(authMode === "login" || registrationCodeSent) && (
                 <>
-                  <div className="recovery-question"><span>验证问题</span><strong>{recoveryChallenge.question}</strong></div>
-                  <label><span>验证答案</span><input value={recoveryAnswer} onChange={(event) => setRecoveryAnswer(event.target.value)} type="text" autoComplete="off" required minLength={3} maxLength={200} /></label>
-                  <label><span>新密码</span><input value={recoveryNextPassword} onChange={(event) => setRecoveryNextPassword(event.target.value)} type="password" autoComplete="new-password" required minLength={12} maxLength={1024} /></label>
-                  <label><span>重复新密码</span><input value={recoveryNextPasswordRepeat} onChange={(event) => setRecoveryNextPasswordRepeat(event.target.value)} type="password" autoComplete="new-password" required minLength={12} maxLength={1024} /></label>
-                </>
-              ) : null}
-              <button className="auth-submit" disabled={!authChecked || task.status === "submitting"} type="submit">{task.status === "submitting" ? "处理中..." : recoveryChallenge ? "验证并重设密码" : "下一步：验证问题"}</button>
-              {task.message && <p className={`auth-message ${task.status === "error" ? "error" : ""}`}>{task.message}{task.meta ? ` · ${task.meta}` : ""}</p>}
-            </form>
-          ) : (
-            <form className="auth-form" onSubmit={(event) => { event.preventDefault(); void submitAuth(); }}>
-              <label><span>邮箱</span><input value={authEmail} onChange={(event) => setAuthEmail(event.target.value)} type="email" autoComplete="email" required maxLength={254} /></label>
               <label><span>密码</span><input value={authPassword} onChange={(event) => setAuthPassword(event.target.value)} type="password" autoComplete={authMode === "login" ? "current-password" : "new-password"} required minLength={authMode === "register" ? 12 : 1} maxLength={1024} /></label>
               {authMode === "register" && (
                 <>
                   <label><span>重复密码</span><input value={authPasswordRepeat} onChange={(event) => setAuthPasswordRepeat(event.target.value)} type="password" autoComplete="new-password" required minLength={12} maxLength={1024} /></label>
-                  <label>
-                    <span>忘记密码验证问题</span>
-                    <select value={recoveryQuestionId} onChange={(event) => setRecoveryQuestionId(event.target.value)} required>
-                      {recoveryQuestions.map((item) => <option value={item.id} key={item.id}>{item.question}</option>)}
-                    </select>
-                  </label>
-                  <label><span>验证答案</span><input value={recoveryAnswer} onChange={(event) => setRecoveryAnswer(event.target.value)} type="text" autoComplete="off" required minLength={8} maxLength={200} /></label>
-                  <p className="muted">答案仅保存不可逆哈希；忘记密码时必须正确回答。</p>
+                  <p className="muted">验证码 10 分钟有效，最多尝试 5 次。密码遗失由本机管理员处理。</p>
                 </>
               )}
-              <button className="auth-submit" disabled={!authChecked || task.status === "submitting"} type="submit">{task.status === "submitting" ? "处理中..." : authMode === "register" ? "注册并进入" : "登录"}</button>
-              {authMode === "login" && <button className="forgot-password-button" type="button" onClick={() => { setAuthMode("recover"); setRecoveryChallenge(null); setTask({ status: "idle", message: "请输入账户邮箱。" }); }}>忘记密码？</button>}
+                </>
+              )}
+              <button className="auth-submit" disabled={!authChecked || task.status === "submitting"} type="submit">{task.status === "submitting" ? "处理中..." : authMode === "register" ? registrationCodeSent ? "验证并注册" : "发送邮箱验证码" : "登录"}</button>
               {!registrationEnabled && <p className="muted">公开注册已关闭，请使用已有账户登录。</p>}
               {task.message && <p className={`auth-message ${task.status === "error" ? "error" : ""}`}>{task.message}{task.meta ? ` · ${task.meta}` : ""}</p>}
-            </form>
-          )}
+          </form>
         </section>
       </main>
     );
@@ -1988,20 +1973,20 @@ export function App() {
                   <figcaption>
                     <strong>{asset.name}</strong>
                     <span>{asset.relativePath}</span>
-                    <div>
+                    {authUser.role === "admin" && <div>
                       <button onClick={() => runAssetAction(asset, "regenerate")}>重新生成</button>
                       <button onClick={() => runAssetAction(asset, "edit")}>编辑</button>
                       {asset.type === "image" && <button onClick={() => runAssetAction(asset, "generate-video")}>转视频</button>}
-                    </div>
+                    </div>}
                   </figcaption>
                 </figure>
               )) : (
                 <div className="asset-empty">
                   <p className="muted">角色样图、关键帧和镜头视频生成后，会按当前项目显示在这里。</p>
-                  <div>
+                  {authUser.role === "admin" ? <div>
                     <button onClick={() => runAssetAction(null, "generate-image")}>生成图片版本</button>
                     <button onClick={() => runAssetAction(null, "generate-video")}>生成视频版本</button>
-                  </div>
+                  </div> : <p className="muted">平台资产生成仅对管理员开放；普通账户使用自己的模型 Key 运行 Film 工作流。</p>}
                 </div>
               )}
             </div>
@@ -2177,8 +2162,7 @@ export function App() {
           </div>
           <div className="topbar-actions">
             <span className="account-label">{authUser.email}</span>
-            <button className="icon-button" aria-label="账户安全" title="账户安全" onClick={() => void openPasswordPanel()}><KeyRound size={18} /></button>
-            <button className="icon-button" aria-label="Search" title="Search"><Search size={18} /></button>
+            <button ref={securityButtonRef} className="icon-button" aria-label="账户安全" title="账户安全" onClick={openPasswordPanel}><KeyRound size={18} /></button>
             <button className="icon-button" aria-label="Settings" title="Settings" onClick={() => { setView("workspace"); openModelSettings(); }}><SlidersHorizontal size={18} /></button>
             <button className="primary-action" onClick={openNewProject}><Plus size={18} />新项目</button>
             <button className="icon-button" aria-label="Logout" title="Logout" onClick={logout}><X size={18} /></button>
@@ -2253,7 +2237,7 @@ export function App() {
           </div>
 
           <div className="preview-stage" id="canvas">
-            <img src={projectPreviewAsset?.url || "/assets/dino.png"} alt={currentProject ? `${currentProject.title} 项目视觉` : "项目关键视觉"} decoding="async" />
+            <img src={projectPreviewAsset?.url || "/assets/dino.webp"} alt={currentProject ? `${currentProject.title} 项目视觉` : "项目关键视觉"} decoding="async" />
             <div className="preview-overlay">
               <span>Canvas Preview</span>
               <strong>{currentProject?.title || "尚未选择项目"}</strong>
@@ -2847,6 +2831,14 @@ function compactText(text: string, maxLength: number) {
   return value.length > maxLength ? `${value.slice(0, maxLength)}...` : value;
 }
 
+function formatBytes(bytes: number) {
+  const value = Math.max(0, Number(bytes) || 0);
+  if (value < 1024) return `${value} B`;
+  if (value < 1024 ** 2) return `${(value / 1024).toFixed(1)} KB`;
+  if (value < 1024 ** 3) return `${(value / 1024 ** 2).toFixed(1)} MB`;
+  return `${(value / 1024 ** 3).toFixed(1)} GB`;
+}
+
 function isContinuationPrompt(text: string) {
   return /^(请继续|继续|继续。|继续吧|go on|continue)$/i.test(String(text || "").trim());
 }
@@ -3016,12 +3008,6 @@ function formatRunTime(value: string | null) {
   }).format(new Date(value));
 }
 
-function runHistoryTitle(run: RuntimeRun) {
-  const text = String(run.prompt || "").replace(/\s+/g, " ").trim();
-  if (!text) return shortRunId(run.id);
-  return text.length > 32 ? `${text.slice(0, 32)}...` : text;
-}
-
 function conversationHistoryTitle(conversation: ConversationEntry) {
   return compactText(conversation.prompt || conversation.latestPrompt || conversation.latestRun.id, 36);
 }
@@ -3031,14 +3017,6 @@ function conversationHistoryMeta(conversation: ConversationEntry) {
     conversation.runCount > 1 ? `连续 ${conversation.runCount} 轮` : "单轮对话",
     conversation.selectedAgents.length ? `${conversation.selectedAgents.length} 个岗位` : "",
     conversation.status ? runStatusText(conversation.status) : ""
-  ].filter(Boolean).join(" · ");
-}
-
-function runHistoryMeta(run: RuntimeRun) {
-  return [
-    run.parentRunId ? "续写" : "新对话",
-    run.selectedAgents?.length ? `${run.selectedAgents.length} 个岗位` : "",
-    run.status ? runStatusText(run.status) : ""
   ].filter(Boolean).join(" · ");
 }
 

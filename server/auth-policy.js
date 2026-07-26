@@ -67,22 +67,3 @@ export async function verifyPasswordRecord(password, user) {
   const stored = Buffer.from(passwordHash, "hex");
   return candidate.length === stored.length && timingSafeEqual(candidate, stored);
 }
-
-export function normalizeRecoveryAnswer(answer) {
-  return String(answer || "")
-    .normalize("NFKC")
-    .trim()
-    .toLocaleLowerCase("zh-CN")
-    .replace(/\s+/g, " ");
-}
-
-export async function deriveRecoveryAnswerRecord(answer, salt = randomBytes(16).toString("hex")) {
-  return derivePasswordRecord(`film-recovery-v1:${normalizeRecoveryAnswer(answer)}`, salt);
-}
-
-export async function verifyRecoveryAnswerRecord(answer, recovery) {
-  return verifyPasswordRecord(`film-recovery-v1:${normalizeRecoveryAnswer(answer)}`, {
-    passwordSalt: recovery?.answerSalt,
-    passwordHash: recovery?.answerHash
-  });
-}

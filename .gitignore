@@ -6,6 +6,10 @@ env/
 virtualenv/
 __pycache__/
 *.py[cod]
+.tox/
+.nox/
+.hypothesis/
+pip-wheel-metadata/
 
 # === 构建产物 ===
 dist/
@@ -17,6 +21,10 @@ coverage/
 .ruff_cache/
 test-results/
 playwright-report/
+blob-report/
+__snapshots__/
+*.test.log
+*.spec.local.*
 
 # === 环境变量 / API Key ===
 .env
@@ -24,6 +32,7 @@ playwright-report/
 .env.production
 server/.env
 server/model-config.json
+/server/.secrets/
 
 # === 用户数据 ===
 server/users.json
@@ -66,8 +75,36 @@ agent/**/*.webp
 public/assets/polly.png
 public/assets/slide-scene.png
 
+# 设计源文件、模型权重、归档和本地备份不进入源码仓库
+*.psd
+*.psb
+*.aep
+*.blend
+*.safetensors
+*.ckpt
+*.pt
+*.pth
+*.onnx
+*.zip
+*.7z
+*.rar
+*.tar
+*.tar.gz
+*.tgz
+*.bak
+*.backup
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+/backups/
+
 # === 内部整改文档与 Agent 临时任务记录（非运行必需） ===
 /docs/
+/*_REPORT.md
+/AUDIT*.md
+/SECURITY_REVIEW*.md
+/MIGRATION_REPORT*.md
+/RELEASE_NOTES*.md
 agent/**/findings.md
 agent/**/progress.md
 agent/**/task_plan.md
